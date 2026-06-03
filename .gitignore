@@ -1,0 +1,86 @@
+############ concrete files
+# document embeddings FAISS and numpy storage
+document_embeddings/faiss_docs_resolutions.bin
+document_embeddings/faiss_docs_resolutions.npy
+
+# instruments
+instruments/ohchr_instruments.csv
+instruments/ohchr_instruments-core.csv
+instruments/ohchr_instruments-universal.csv
+instruments/ohchr_instruments_detailed.csv
+
+# resolutions
+resolutions/ga_resolutions_1946_2019.csv
+resolutions/ga_resolutions_1946_2019-subjects.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# KDE directory preferences
+.directory
+
+# Linux trash folder which might appear on any partition or disk
+.Trash-*
+
+# .nfs files are created when an open file is removed but is still being accessed
+.nfs*
+
+### PyCharm ###
+.idea/
+
+
+.Python
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+.pdm.toml
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+myenv/
