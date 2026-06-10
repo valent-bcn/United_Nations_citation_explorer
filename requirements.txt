@@ -4,3 +4,4 @@ tqdm>=4.66.0
 selenium>=4.15.0
 webdriver-manager>=4.0.0
 transformers>=4.40.0
+torch>=2.6.0

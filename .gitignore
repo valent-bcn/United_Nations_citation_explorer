@@ -13,9 +13,10 @@ instruments/ohchr_instruments_detailed.csv
 resolutions/ga_resolutions_1946_2019.csv
 resolutions/ga_resolutions_1946_2019-subjects.csv
 resolutions/ga_citations_1946_2019.csv
+resolutions/ga_citations_1946_2019_OLD.csv
 
 # Qwen data
-Qwen3_4B/data/
+Qwen3/data/
 
 # OS files
 .DS_Store

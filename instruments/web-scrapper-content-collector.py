@@ -53,7 +53,7 @@ results = []
 # ----------------------------
 
 def patch_webdriver_flag(driver):
-    """Remove Selenium's navigator.webdriver fingerprint. Must be called after every get()."""
+    """ For better chances not to be detected as a bot, better we remove Selenium s navigator.webdriver fingerprint."""
     try:
         driver.execute_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -63,7 +63,7 @@ def patch_webdriver_flag(driver):
 
 
 def is_security_page(driver):
-    """Return True if the current page is still the security interstitial."""
+    """ We rely on general patterns in website text. """
     try:
         body = driver.find_element(By.TAG_NAME, "body").text.lower()
         return (
@@ -78,15 +78,6 @@ def is_security_page(driver):
 
 
 def wait_for_real_page(driver, timeout=HUMAN_CLICK_TIMEOUT):
-    """
-    Wait for the security interstitial to clear.
-
-    - If the page clears on its own (automatic JS verification): great.
-    - If a 'I am human' button appeared: print a prompt so you can click it,
-      then keep polling until the real page loads or timeout expires.
-
-    Returns True if the real page loaded, False if timed out.
-    """
     start = time.time()
     alerted = False
 

@@ -1,0 +1,20 @@
+# config/train.yaml — Qwen3-0.6B fine-tune config
+# This file can change to be used with Qwen3-8B. The 0.6B is for testing, first steps, mainly
+
+model_name: "Qwen/Qwen3-0.6B"
+
+data_dir:   "data"
+output_dir: "outputs"
+
+# Training
+num_epochs:          5
+batch_size:          4          # per-device batch size
+grad_accum_steps:    4          # effective batch = batch_size * grad_accum_steps = 16
+learning_rate:       2.0e-5
+weight_decay:        0.01
+warmup_ratio:        0.05       # 5% of total steps used for warmup
+max_length:          2048       # max token length per sample
+fp16:                false      # set true if your GPU supports it (saves memory)
+
+# Checkpointing
+save_every_n_epochs: 2          # save a checkpoint every N epochs (+ always at the final epoch)

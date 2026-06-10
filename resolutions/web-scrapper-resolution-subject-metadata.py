@@ -16,7 +16,7 @@ from selenium.webdriver.support import expected_conditions as EC
 # ----------------------------
 # SETTINGS
 # ----------------------------
-INPUT_CSV = "./ga_resolutions_1946_2019.csv"
+INPUT_CSV = "./ga_resolutions_1946_2019_OLD.csv"
 OUTPUT_CSV = "./ga_resolutions_1946_2019-subjects.csv"
 load_dotenv()
 BATCH_SIZE = 5000
@@ -35,8 +35,7 @@ df_full = pd.read_csv(INPUT_CSV)
 df_full = df_full[["res_id2_unlet", "session_reg"]].drop_duplicates().reset_index(drop=True)
 print(f"Total unique resolutions: {len(df_full)}")
 
-# --- Checkpoint: subtract already-scraped IDs ---
-# OUTPUT_CSV doubles as the checkpoint: if it exists, read which res_ids are done.
+# OUTPUT_CSV may contain already scrapped resolution, we may want to skip those
 if os.path.exists(OUTPUT_CSV):
     df_done = pd.read_csv(OUTPUT_CSV)
     done_ids = set(df_done["res_id"].dropna().unique())
@@ -47,7 +46,7 @@ else:
 df_todo = df_full[~df_full["res_id2_unlet"].isin(done_ids)].reset_index(drop=True)
 print(f"Remaining to scrape: {len(df_todo)}")
 
-# --- Take only the next batch ---
+# We filter by the resolution we still need to scrape
 df_batch = df_todo.iloc[:BATCH_SIZE].reset_index(drop=True)
 print(f"This run: {len(df_batch)} resolutions (batch size={BATCH_SIZE})")
 
@@ -74,7 +73,9 @@ results = []
 # SOUND ALERT
 # ----------------------------
 def play_warning():
-    """Gentle alert sound — cross-platform."""
+    """Gentle alert sound — cross-platform.
+    Problably is going to raise an Error when not run in a linux machine.
+    """
     try:
         # Linux (freedesktop systems — Ubuntu, Fedora, etc.)
         os.system("paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga 2>/dev/null &")
@@ -90,7 +91,7 @@ def play_warning():
 # ----------------------------
 
 def patch_webdriver_flag(driver):
-    """Remove Selenium's navigator.webdriver fingerprint. Must be called after every get()."""
+    """ For better chances not to be detected as a bot, better we remove Selenium s navigator.webdriver fingerprint."""
     try:
         driver.execute_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -98,9 +99,8 @@ def patch_webdriver_flag(driver):
     except Exception:
         pass
 
-
 def is_security_page(driver):
-    """Return True if the current page is still the security interstitial."""
+    """ We rely on general patterns in website text. """
     try:
         body = driver.find_element(By.TAG_NAME, "body").text.lower()
         return (
@@ -127,7 +127,7 @@ def wait_for_real_page(driver, timeout=HUMAN_CLICK_TIMEOUT):
             except Exception:
                 pass
 
-        # Human verification detected — play sound + prompt
+        # Human verification detected
         if not alerted and is_security_page(driver):
             play_warning()
 
@@ -169,6 +169,7 @@ def scrape_downloads(driver):
                     txt = cell.text.strip()
                     if txt.isdigit():
                         total += int(txt)
+                # Better avoid forcing None when no downloads have taken place. We may want to sort it and plot it in the future.
                 return total
     except Exception:
         return None

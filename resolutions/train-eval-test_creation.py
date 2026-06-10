@@ -7,7 +7,7 @@ import json
 # ----------------------------
 CITATIONS_CSV = "./ga_citations_1946_2019.csv"
 RESOLUTIONS_CSV = "./ga_resolutions_1946_2019.csv"
-OUTPUT_PATH = "../Qwen3_4B/data/"
+OUTPUT_PATH = "../Qwen3/data/"
 
 # ----------------------------
 # LOAD DATA
