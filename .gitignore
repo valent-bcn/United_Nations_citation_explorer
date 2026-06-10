@@ -15,6 +15,11 @@ resolutions/ga_resolutions_1946_2019-subjects.csv
 resolutions/ga_citations_1946_2019.csv
 resolutions/ga_citations_1946_2019_OLD.csv
 
+# conventions, protocols, recommendations
+conv-prot-rec/conventions-protocols-recommendations.txt
+conv-prot-rec/conventions-protocols-recommendations.csv
+conv-prot-rec/citations_conv_prot_rec.csv
+
 # Qwen data
 Qwen3/data/
 
