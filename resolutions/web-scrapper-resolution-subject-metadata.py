@@ -13,6 +13,7 @@ from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+
 # ----------------------------
 # SETTINGS
 # ----------------------------
@@ -27,6 +28,7 @@ BASE_DOMAIN = "https://documents.un.org/"
 # How long (seconds) to wait for you to click the "I am human" button
 # before giving up on a page. 
 HUMAN_CLICK_TIMEOUT = 60
+
 
 # ----------------------------
 # LOAD DATA
@@ -86,10 +88,10 @@ def play_warning():
     except Exception:
         print("\a")  # fallback: terminal bell
 
+
 # ----------------------------
 # HELPERS
 # ----------------------------
-
 def patch_webdriver_flag(driver):
     """ For better chances not to be detected as a bot, better we remove Selenium s navigator.webdriver fingerprint."""
     try:
@@ -139,6 +141,7 @@ def wait_for_real_page(driver, timeout=HUMAN_CLICK_TIMEOUT):
         time.sleep(2)
 
     return False
+
 
 # ----------------------------
 # SCRAPE FIELDS
