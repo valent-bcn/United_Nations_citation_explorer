@@ -11,13 +11,13 @@ CITATIONS_CSV = "./ga_citations_1946_2019.csv"
 RESOLUTIONS_CSV = "./ga_resolutions_1946_2019.csv"
 OUTPUT_PATH = "../Qwen3/data/"
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-
+MAX_TOKEN_LENGTH = 2826
 # ----------------------------
 # HELPERS
 # ----------------------------
 def trim_contents(text, tokenizer,
-                     target_tokens=3000,
-                     max_tokens=3040):
+                     target_tokens: int,
+                     max_tokens: int):
 
     # Total length
     total_tokens = len(tokenizer.encode(text, add_special_tokens=False))
@@ -150,7 +150,7 @@ def main():
     new_df = res_df.copy()
 
     new_df["content"] = new_df["content"].apply(
-        lambda x: trim_contents(x, tokenizer)
+        lambda x: trim_contents(x, tokenizer, target_tokens=MAX_TOKEN_LENGTH, max_tokens=MAX_TOKEN_LENGTH+30)
     )
 
     # Remove discarded documents
