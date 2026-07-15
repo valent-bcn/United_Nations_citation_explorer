@@ -3,25 +3,29 @@
 document_embeddings/faiss_docs_resolutions.bin
 document_embeddings/faiss_docs_resolutions.npy
 
+# treaties
+treaties/*.csv
+treaties/*.txt
+treaties/*.pdf
+treaties/*.md
+
 # instruments
-instruments/ohchr_instruments.csv
-instruments/ohchr_instruments-core.csv
-instruments/ohchr_instruments-universal.csv
-instruments/ohchr_instruments_detailed.csv
+instruments/*.csv
+instruments/*.txt
+instruments/*.pdf
+instruments/*.md
 
 # resolutions
-resolutions/ga_resolutions_1946_2019.csv
-resolutions/ga_resolutions_1946_2019-subjects.csv
-resolutions/ga_citations_1946_2019.csv
-resolutions/ga_citations_1946_2019_OLD.csv
-resolutions/sc_resolutions_1946_2026.csv
-resolutions/sc_citations.csv
-resolutions/ohchr_resolutions.csv
+resolutions/*.csv
+resolutions/*.txt
+resolutions/*.pdf
+resolutions/*.md
 
 # conventions, protocols, recommendations
-conv-prot-rec/conventions-protocols-recommendations.txt
-conv-prot-rec/conventions-protocols-recommendations.csv
-conv-prot-rec/citations_conv_prot_rec.csv
+conv-prot-rec/*.csv
+conv-prot-rec/*.txt
+conv-prot-rec/*.pdf
+conv-prot-rec/*.md
 
 # Qwen data
 Qwen3/data/
