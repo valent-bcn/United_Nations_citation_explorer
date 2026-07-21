@@ -80,6 +80,10 @@ def sort_and_split(resolutions_dataframe: pd.DataFrame,
     sc_df['sc_resolution'] = sc_df['sc_resolution'].str.replace(" ", "")
     ohchr_df['ohchr_resolution'] = ohchr_df['ohchr_resolution'].str.replace(" ", "")
 
+    # Normalize the join key to match cit_df's post-prefix format
+    sc_df["res_id2"] = "A/RES/" + sc_df["res_id2"].str.strip().str.replace(" ", "").str.upper()
+    ohchr_df["res_id2"] = "A/RES/" + ohchr_df["res_id2"].str.strip().str.replace(" ", "").str.upper()
+
     # First we take the resolution ids of the ones we want to take for train+val and for test
     res_df = res_df[["res_id2_unlet", "date_p"]].drop_duplicates().reset_index(
         drop=True)  # res_id has letters, we want the whole resolution (unlet)
