@@ -13,7 +13,7 @@ treaties/*.md
 instruments/*.csv
 instruments/*.txt
 instruments/*.pdf
-instruments/*.md
+#instruments/*.md
 
 # resolutions
 resolutions/*.csv
