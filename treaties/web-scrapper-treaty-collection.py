@@ -1,25 +1,16 @@
 """
 UNTC (UN Treaty Collection) title-search scraper.
 
-For each string in SEARCH_TERMS, this script:
-  1. Loads the UNTSOnline title-search page.
-  2. Types the term into the "Title/Keyword" field and submits the search.
-  3. Scrapes the resulting table(s) (following pagination if present).
-  4. Tags every scraped row with a `search_term` column equal to that term.
-  5. Appends the term's rows to a master DataFrame.
-
-At the end, the master DataFrame (all terms stacked) is saved to CSV/XLSX.
-
-Requirements:
-    pip install selenium webdriver-manager pandas lxml beautifulsoup4
-
-You also need a Chrome/Chromium browser installed locally. This script
-was NOT executed in this sandbox (no browser/network access to the site
-from here) -- run it on your own machine.
+OLD version, kept for testing.
+In order to use the up to date version, use the Class UNTCSearcher
 """
 
+import re
 import time
+from urllib.parse import urljoin
+
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -39,7 +30,8 @@ from selenium.webdriver.chrome.service import Service
 # CONFIG
 # --------------------------------------------------------------------------
 
-URL = "https://treaties.un.org/Pages/UNTSOnline.aspx?id=2&clang=_en"
+BASE_URL = "https://treaties.un.org"
+URL = f"{BASE_URL}/Pages/UNTSOnline.aspx?id=2&clang=_en"
 
 # List of search terms -- each becomes both the search query and the
 # identifier tagged onto its resulting rows.
@@ -66,6 +58,10 @@ PAGE_LOAD_TIMEOUT = 20
 HEADLESS = False  # set True once you've confirmed it works, for speed
 
 OUTPUT_CSV = "untc_title_search_results.csv"
+
+# Delay (seconds) between requests to each treaty's details page, to be
+# polite to the server. Increase if you hit rate limiting.
+DETAILS_FETCH_DELAY = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -123,12 +119,15 @@ def parse_table(table_html, search_term):
         row = {}
         for i, td in enumerate(cells):
             col_name = headers[i] if i < len(headers) and headers[i] else f"col_{i}"
-            # "Participants" column mostly just holds a "See Details" link;
-            # capture both the visible text and the href if present.
             link = td.find("a")
-            if link and link.get("href"):
-                row[col_name] = link.get_text(strip=True) or "See Details"
-                row[f"{col_name}_link"] = link["href"]
+            if col_name == "Participants" and link and link.get("href"):
+                # This column is just a "See Details" link to the treaty's
+                # detail page -- store the absolute URL as its own column
+                # instead of the (uninformative) "See Details" text.
+                row["url"] = urljoin(BASE_URL, link["href"])
+            elif link and link.get("href"):
+                row[col_name] = link.get_text(strip=True)
+                row[f"{col_name}_link"] = urljoin(BASE_URL, link["href"])
             else:
                 row[col_name] = td.get_text(strip=True)
         rows.append(row)
@@ -213,6 +212,125 @@ def scrape_all_pages_for_term(driver, term):
     return pd.DataFrame()
 
 
+def _norm(text):
+    """Normalize header/label text for loose matching (nbsp, case, spacing)."""
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip().lower()
+
+
+def fetch_details(session, url):
+    """
+    Fetch a treaty's showDetails.aspx page and extract:
+        - full_title
+        - place
+        - date
+        - text_document_urls (list)
+        - volume_pdf_urls (list)
+    Returns a dict; missing fields are left as None / empty list.
+    """
+    result = {
+        "full_title": None,
+        "place": "",
+        "date": "",
+        "text_document_urls": [],
+        "volume_pdf_urls": [],
+    }
+    try:
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"    !! Failed to fetch details page {url}: {e}")
+        return result
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # --- Full title ---
+    title_span = soup.find(id="lblTitle1")
+    if title_span:
+        result["full_title"] = title_span.get_text(strip=True)
+
+    # --- Place / Date table (the "Places/dates of conclusion" table, id="dgsign") ---
+    sign_table = soup.find("table", id="dgsign")
+    if sign_table is None:
+        # Fallback: any table whose header row is exactly Place / Date.
+        for table in soup.find_all("table"):
+            header_texts = [_norm(th.get_text()) for th in table.find_all("th")]
+            if "place" in header_texts and "date" in header_texts:
+                sign_table = table
+                break
+
+    if sign_table is not None:
+        places, dates = [], []
+        data_rows = sign_table.find_all("tr")[1:]  # skip header row
+        for row in data_rows:
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                place_text = cells[0].get_text(strip=True)
+                date_text = cells[1].get_text(strip=True)
+                if place_text:
+                    places.append(place_text)
+                if date_text:
+                    dates.append(date_text)
+        result["place"] = "; ".join(places)
+        result["date"] = "; ".join(dates)
+
+    # --- Generic label -> value rows (th/td pairs), used for the PDF links ---
+    for th in soup.find_all("th"):
+        label = _norm(th.get_text())
+        if not label:
+            continue
+        td = th.find_next_sibling("td")
+        if td is None:
+            continue
+
+        hrefs = [urljoin(BASE_URL, a["href"]) for a in td.find_all("a", href=True) if a.get("href")]
+
+        if "text document" in label:
+            result["text_document_urls"].extend(hrefs)
+        elif "volume" in label and "pdf" in label:
+            result["volume_pdf_urls"].extend(hrefs)
+
+    return result
+
+
+def enrich_with_details(df, delay=0.5):
+    """
+    For each unique 'url' in df, fetch the treaty's details page and merge
+    in full_title / place / date / text_document_urls / volume_pdf_urls.
+    """
+    if df.empty or "url" not in df.columns:
+        return df
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; UNTC-scraper/1.0)"})
+
+    unique_urls = df["url"].dropna().unique().tolist()
+    print(f"Fetching details for {len(unique_urls)} unique treaty pages...")
+
+    details_by_url = {}
+    for i, url in enumerate(unique_urls, 1):
+        print(f"  [{i}/{len(unique_urls)}] {url}")
+        details_by_url[url] = fetch_details(session, url)
+        time.sleep(delay)  # be polite to the server
+
+    details_df = (
+        pd.DataFrame.from_dict(details_by_url, orient="index")
+        .reset_index()
+        .rename(columns={"index": "url"})
+    )
+    # Join list columns into readable strings for CSV/XLSX friendliness.
+    details_df["text_document_urls"] = details_df["text_document_urls"].apply(lambda x: "; ".join(x) if x else "")
+    details_df["volume_pdf_urls"] = details_df["volume_pdf_urls"].apply(lambda x: "; ".join(x) if x else "")
+
+    merged = df.merge(details_df, on="url", how="left")
+
+    # Replace the truncated search-results Title with the full title where available.
+    if "Title" in merged.columns:
+        merged["Title"] = merged["full_title"].where(merged["full_title"].notna(), merged["Title"])
+        merged = merged.drop(columns=["full_title"])
+
+    return merged
+
+
 # --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
@@ -240,6 +358,8 @@ def main():
         final_df = pd.concat(all_results, ignore_index=True)
     else:
         final_df = pd.DataFrame()
+
+    final_df = enrich_with_details(final_df, delay=DETAILS_FETCH_DELAY)
 
     final_df.to_csv(OUTPUT_CSV, index=False)
 
