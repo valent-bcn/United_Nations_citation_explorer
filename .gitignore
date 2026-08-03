@@ -45,7 +45,8 @@ Thumbs.db
 
 ### PyCharm ###
 .idea/
-
+# All cache
+**/__pycache__/
 
 .Python
 
