@@ -280,11 +280,11 @@ class UNTCSearcher:
         Returns a dict; missing fields are left as None / empty list.
         """
         result = {
-            "full_title": None,
-            "place": "",
-            "date": "",
-            "text_document_urls": [],
-            "volume_pdf_urls": [],
+            "Full_title": None,
+            "Place": "",
+            "Date": "",
+            "Text_document_urls": [],
+            "Volume_pdf_urls": [],
         }
         try:
             resp = session.get(url, timeout=20)
@@ -298,7 +298,7 @@ class UNTCSearcher:
         # --- Full title ---
         title_span = soup.find(id="lblTitle1")
         if title_span:
-            result["full_title"] = title_span.get_text(strip=True)
+            result["Full_title"] = title_span.get_text(strip=True)
 
         # --- Place / Date table (the "Places/dates of conclusion" table, id="dgsign") ---
         sign_table = soup.find("table", id="dgsign")
@@ -322,8 +322,8 @@ class UNTCSearcher:
                         places.append(place_text)
                     if date_text:
                         dates.append(date_text)
-            result["place"] = "; ".join(places)
-            result["date"] = "; ".join(dates)
+            result["Place"] = "; ".join(places)
+            result["Date"] = "; ".join(dates)
 
         # --- Generic label -> value rows (th/td pairs), used for the PDF links ---
         for th in soup.find_all("th"):
@@ -337,9 +337,9 @@ class UNTCSearcher:
             hrefs = [urljoin(self.BASE_URL, a["href"]) for a in td.find_all("a", href=True) if a.get("href")]
 
             if "text document" in label:
-                result["text_document_urls"].extend(hrefs)
+                result["Text_document_urls"].extend(hrefs)
             elif "volume" in label and "pdf" in label:
-                result["volume_pdf_urls"].extend(hrefs)
+                result["Volume_pdf_urls"].extend(hrefs)
 
         return result
 
@@ -382,11 +382,11 @@ class UNTCSearcher:
         merged = df.merge(details_df, on="url", how="left")
 
         if "Title" in merged.columns:
-            merged["Title"] = merged["full_title"].where(
-                merged["full_title"].notna(),
+            merged["Title"] = merged["Full_title"].where(
+                merged["Full_title"].notna(),
                 merged["Title"],
             )
-            merged = merged.drop(columns=["full_title"])
+            merged = merged.drop(columns=["Full_title"])
 
         return merged
 
