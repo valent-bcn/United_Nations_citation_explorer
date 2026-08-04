@@ -35,6 +35,10 @@ class UNTCSearcher:
         "ctl00_ctl00_ContentPlaceHolder1_"
         "ContentPlaceHolderInnerPage_dgSearch"
     )
+    MESSAGE_ID = (
+        "ctl00_ctl00_ContentPlaceHolder1_"
+        "ContentPlaceHolderInnerPage_lblMsg"
+    )
 
     SEARCH_BUTTON_ID = None
 
@@ -51,6 +55,13 @@ class UNTCSearcher:
         self.timeout = timeout if timeout is not None else self.PAGE_LOAD_TIMEOUT
 
         self.driver = self.make_driver()
+
+    def has_no_results(self):
+        try:
+            msg = self.driver.find_element(By.ID, self.MESSAGE_ID)
+            return "record not found" in msg.text.lower()
+        except NoSuchElementException:
+            return False
 
     def close(self):
         self.driver.quit()
@@ -78,7 +89,11 @@ class UNTCSearcher:
     def search(self, term):
 
         try:
-            self.search_title(term)
+            found = self.search_title(term)
+
+            if not found:
+                print(f"No results found for {term}.")
+                return pd.DataFrame() # Empty
 
             df = self.scrape_all_pages_for_term(term)
             df = self.enrich_with_details(df)
@@ -89,11 +104,11 @@ class UNTCSearcher:
 
         except TimeoutException:
             print(f"Timed out waiting for results for {term}.")
-            return pd.DataFrame()
+            return pd.DataFrame() # Empty
 
         except Exception as e:
             print(f"Error searching {term}: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame() # Empty
 
     def find_results_table_html(self):
         try:
@@ -231,10 +246,14 @@ class UNTCSearcher:
 
         WebDriverWait(self.driver, self.timeout).until(
             lambda d: (
-                    self.find_results_table_html() is not None
-                    or "no records" in d.page_source.lower()
+                self.find_results_table_html() is not None
+                or self.has_no_results()
             )
         )
+
+        if self.has_no_results():
+            return False
+        return True
 
     def scrape_all_pages_for_term(self, term):
         dfs = []
