@@ -9,6 +9,11 @@ treaties/*.txt
 treaties/*.pdf
 treaties/*.md
 
+# unesco instruments
+unesco_instruments/*.csv
+unesco_instruments/*.zip
+unesco_instruments/*.txt
+
 # instruments
 instruments/*.csv
 instruments/*.txt
