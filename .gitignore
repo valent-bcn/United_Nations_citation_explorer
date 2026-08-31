@@ -12,7 +12,8 @@ treaties/*.md
 # unesco instruments
 unesco_instruments/*.csv
 unesco_instruments/*.zip
-unesco_instruments/*.txt
+unesco_instruments/txt/*.txt
+unesco_instruments/pdf_files/*.pdf
 
 # instruments
 instruments/*.csv

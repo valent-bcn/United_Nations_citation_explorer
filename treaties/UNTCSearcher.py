@@ -7,17 +7,17 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
     StaleElementReferenceException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
 
 
 class UNTCSearcher:
@@ -410,7 +410,6 @@ class UNTCSearcher:
                                    "Conclusion Date": "conclusion_date",
                                    "Entry into Force Date": "entry_into_force_date",
                                    "Treaty Type": "treaty_type"}, inplace=True)
-            #merged = merged.drop(columns=["full_title", ""])
 
             columns_to_drop = ["full_title"]
             if "" in merged.columns:
