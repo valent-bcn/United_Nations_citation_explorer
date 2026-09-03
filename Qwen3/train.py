@@ -379,7 +379,6 @@ def train(cfg: TrainConfig, reset: bool = False):
                     latest_ckpt,
                 )
                 print(f"  Saved checkpoint → {ckpt_dir}")
-                
     log = pd.DataFrame({'step': step_log, 'train_loss': train_loss_log, 'eval_loss': eval_loss_log, 'perplexity': perplexity_log})
     log.to_csv("./train_log.csv", index=False)
 

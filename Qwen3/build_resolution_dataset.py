@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DATA_DIR = Path(".")
 DEFAULT_OUTPUT_DIR = Path("../Qwen3/data/")
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-8B"
-DEFAULT_MAX_TOKEN_LENGTH = 2826
+DEFAULT_MAX_TOKEN_LENGTH = 2926
 DEFAULT_TOKEN_SLACK = 30  # a trimmed candidate must fit within max_tokens + slack
 
 GA_CITATIONS_CURRENT = "ga_citations_1946_2019.csv"
@@ -275,7 +275,7 @@ class ResolutionDatasetBuilder:
             f"Extract from the text only {', '.join(parts)}. "
             "Do not explain, do not add commentary, return only results. "
             f"Use ; as delimiter and follow this order: {', '.join(order)}. "
-            f"Ignore the name of the current document, which is {doc_name}."
+            "Exclude the current document's self code/title."
         )
 
     def format_message_line(self, row) -> dict:
