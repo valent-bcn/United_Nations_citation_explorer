@@ -15,10 +15,10 @@ unesco_instruments/*.zip
 unesco_instruments/txt/*.txt
 unesco_instruments/pdf_files/*.pdf
 
-# instruments
-instruments/*.csv
-instruments/*.txt
-instruments/*.pdf
+#  ohchr instruments
+ohchr_instruments/*.csv
+ohchr_instruments/*.txt
+ohchr_instruments/*.pdf
 #instruments/*.md
 
 # resolutions
