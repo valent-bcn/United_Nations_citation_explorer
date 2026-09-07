@@ -13,10 +13,8 @@ import time
 import random
 import pandas as pd
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +23,11 @@ from selenium.webdriver.support import expected_conditions as EC
 INPUT_CSV = '../../resolutions/ohchr_resolutions.csv'
 DOWNLOAD_DIR = os.path.abspath("./ohchr_pdfs")
 BASE_URL = "https://docs.un.org/en/A/HRC/RES/"
+
+# Optional path to an existing Firefox profile directory to use as a base
+# (e.g. one that's already logged in / has cookies you need). If unset, a
+# fresh temporary profile is created for each run.
+PROFILE_PATH = os.getenv("FIREFOX_PROFILE_PATH")
 
 MIN_WAIT_SECONDS = 4      # polite delay between requests
 MAX_WAIT_SECONDS = 8
@@ -51,42 +54,41 @@ def apply_filters(ohchr_df: pd.DataFrame) -> pd.DataFrame:
     # Remove report like resolutions e.g., A/C.3/74/L.31/Rev.1
     df = df[~df['Text number'].str.lower().str.contains('.', regex=False, na=False)]
 
-    # just for testing
-    #TODO: remove this line when confirming it works
-    df = df.head(10)
-
     return df
 
 
 # ---------------------------------------------------------------------------
 # SELENIUM SETUP
 # ---------------------------------------------------------------------------
-def make_driver(download_dir: str) -> webdriver.Chrome:
-    options = Options()
+def make_driver(download_dir: str) -> webdriver.Firefox:
+    options = FirefoxOptions()
 
-    prefs = {
-        "download.default_directory": download_dir,
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        # This was the bug: False tells Chrome to open PDFs in its built-in
-        # viewer (which is what you were seeing render on screen). True
-        # forces Chrome to treat PDF responses as downloads instead.
-        "plugins.always_open_pdf_externally": True,
-        #"profile.default_content_setting_values.automatic_downloads": 1,
-    }
-    options.add_experimental_option("prefs", prefs)
-    options.add_argument("--start-maximized")
+    # FirefoxProfile(None) creates a fresh temp profile; FirefoxProfile(path)
+    # uses the given directory as a base. Either way we then layer the
+    # download preferences on top.
+    profile = FirefoxProfile(PROFILE_PATH)
 
-    driver = webdriver.Chrome(options=options)
+    profile.set_preference("browser.download.folderList", 2)  # 2 = use custom dir below
+    profile.set_preference("browser.download.dir", download_dir)
+    profile.set_preference("browser.download.useDownloadDir", True)
+    profile.set_preference("browser.download.viewableInternally.enabledTypes", "")
 
-    # Belt-and-suspenders: explicitly set download behavior via CDP too.
-    # This is the more reliable mechanism (works in headless mode as well,
-    # in case you switch to that later), independent of the prefs above.
-    driver.execute_cdp_cmd("Page.setDownloadBehavior", {
-        "behavior": "allow",
-        "downloadPath": download_dir,
-    })
+    # Disable Firefox's built-in PDF.js viewer so PDFs aren't rendered
+    # inline - this is the Firefox equivalent of the Chrome
+    # "always_open_pdf_externally" pref.
+    profile.set_preference("pdfjs.disabled", True)
 
+    # Auto-save these MIME types instead of showing the "what should Firefox
+    # do with this file?" dialog.
+    profile.set_preference(
+        "browser.helperApps.neverAsk.saveToDisk",
+        "application/pdf,application/x-pdf,application/octet-stream",
+    )
+    profile.set_preference("browser.helperApps.alwaysAsk.force", False)
+
+    options.profile = profile
+
+    driver = webdriver.Firefox(options=options)
     return driver
 
 # ---------------------------------------------------------------------------
@@ -99,7 +101,7 @@ def snapshot_dir(download_dir: str) -> set:
 def wait_for_new_download(download_dir: str, files_before: set, timeout: int = DOWNLOAD_TIMEOUT):
     """
     Poll the download directory until a new, fully-downloaded file appears
-    (i.e. not a Chrome .crdownload/.tmp partial file), then return its name.
+    (i.e. not a Firefox .part partial file), then return its name.
     Returns None if the timeout is reached.
     """
     elapsed = 0
@@ -108,8 +110,8 @@ def wait_for_new_download(download_dir: str, files_before: set, timeout: int = D
         files_now = set(os.listdir(download_dir))
         new_files = files_now - files_before
 
-        in_progress = [f for f in new_files if f.endswith(".crdownload") or f.endswith(".tmp")]
-        completed = [f for f in new_files if not f.endswith(".crdownload") and not f.endswith(".tmp")]
+        in_progress = [f for f in new_files if f.endswith(".part")]
+        completed = [f for f in new_files if not f.endswith(".part")]
 
         if completed and not in_progress:
             return completed[0]
@@ -119,8 +121,8 @@ def wait_for_new_download(download_dir: str, files_before: set, timeout: int = D
 
     return None
 
-def download_text(driver: webdriver.Chrome, text_number: str, download_dir: str) -> bool:
 
+def download_text(driver: webdriver.Firefox, text_number: str, download_dir: str) -> bool:
     target_filename = text_number.replace("/", "-") + ".pdf"
     target_path = os.path.join(download_dir, target_filename)
 
@@ -133,65 +135,13 @@ def download_text(driver: webdriver.Chrome, text_number: str, download_dir: str)
 
     files_before = snapshot_dir(download_dir)
 
-    # ---------------------------------------------------------
-    # 1. Load UN document viewer
-    # ---------------------------------------------------------
     try:
         driver.get(url)
-        print(f"[LOADED] {driver.current_url}")
     except Exception as e:
-        print(f"[ERROR] driver.get() failed: {e}")
+        print(f"[ERROR] Could not load {url}: {e}")
         return False
 
-    # ---------------------------------------------------------
-    # 2. Find the PDF URL
-    # ---------------------------------------------------------
-    try:
-        # Look for any link containing ".pdf"
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-
-        pdf_url = None
-
-        for link in links:
-            href = link.get_attribute("href")
-
-            print(href) #TODO: none is a pdf link, the 6 links are basecally the current url
-
-            if href and ".pdf" in href.lower():
-                pdf_url = href
-                break
-
-        if pdf_url is None:
-            print("[ERROR] No PDF link found on Document Viewer.")
-
-            # Useful diagnostic
-            print("[DEBUG] Number of links:", len(links))
-
-            return False
-
-        print(f"[PDF]   {pdf_url}")
-
-    except Exception as e:
-        print(f"[ERROR] Could not extract PDF URL: {e}")
-        return False
-
-    # ---------------------------------------------------------
-    # 3. Navigate directly to PDF
-    # ---------------------------------------------------------
-    try:
-        driver.get(pdf_url)
-        print("[OPEN]  PDF")
-    except Exception as e:
-        print(f"[ERROR] Could not open PDF: {e}")
-        return False
-
-    # ---------------------------------------------------------
-    # 4. Wait for download
-    # ---------------------------------------------------------
-    downloaded_name = wait_for_new_download(
-        download_dir,
-        files_before
-    )
+    downloaded_name = wait_for_new_download(download_dir, files_before)
 
     if downloaded_name is None:
         print(f"[FAIL] Timed out waiting for download of {text_number}")
@@ -199,19 +149,14 @@ def download_text(driver: webdriver.Chrome, text_number: str, download_dir: str)
 
     downloaded_path = os.path.join(download_dir, downloaded_name)
 
-    # ---------------------------------------------------------
-    # 5. Rename
-    # ---------------------------------------------------------
+    # Rename to the requested convention (e.g. 65-20.pdf), regardless of
+    # whatever filename the server/Firefox originally used.
     try:
         os.replace(downloaded_path, target_path)
         print(f"[OK]   Saved as {target_filename}")
         return True
-
     except Exception as e:
-        print(
-            f"[ERROR] Could not rename "
-            f"{downloaded_name} -> {target_filename}: {e}"
-        )
+        print(f"[ERROR] Could not rename {downloaded_name} -> {target_filename}: {e}")
         return False
 
 

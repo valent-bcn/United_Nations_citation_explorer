@@ -20,6 +20,7 @@ ohchr_instruments/*.csv
 ohchr_instruments/*.txt
 ohchr_instruments/*.pdf
 ohchr_instruments/prior_parts/*.csv
+ohchr_instruments/resolution_texts/ohchr_pdfs/*.pdf
 
 # resolutions
 resolutions/*.csv
