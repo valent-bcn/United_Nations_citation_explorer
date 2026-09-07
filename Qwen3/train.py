@@ -58,9 +58,9 @@ class TrainConfig:
     weight_decay: float = 0.001
     warmup_ratio: float = 0.03
     max_grad_norm: float = 1.0
-    eval_steps: int = 400 # check evaluation loss
-    save_steps: int = 400 # save checkpoint + write logs
-    logging_steps: int = 200 # print in terminal
+    eval_steps: int = 500 # check evaluation loss
+    save_steps: int = 500 # save checkpoint + write logs
+    logging_steps: int = 500 # print in terminal
     seed: int = 42
     bf16: bool = True
 
@@ -323,6 +323,7 @@ def train(cfg: TrainConfig, reset: bool = False):
     optimizer.zero_grad()
 
     step_log = []
+    epoch_log = []
     train_loss_log = []
     eval_loss_log = []
     perplexity_log = []
@@ -360,6 +361,7 @@ def train(cfg: TrainConfig, reset: bool = False):
                 print(f"  [eval] loss {eval_loss:.4f} | ppl {perplexity:.2f}")
 
                 step_log.append(global_step)
+                epoch_log.append(epoch+1)
                 train_loss_log.append(avg) # Same as avg on the logging chunk
                 eval_loss_log.append(eval_loss)
                 perplexity_log.append(perplexity)
@@ -379,8 +381,18 @@ def train(cfg: TrainConfig, reset: bool = False):
                     latest_ckpt,
                 )
                 print(f"  Saved checkpoint → {ckpt_dir}")
-    log = pd.DataFrame({'step': step_log, 'train_loss': train_loss_log, 'eval_loss': eval_loss_log, 'perplexity': perplexity_log})
-    log.to_csv("./train_log.csv", index=False)
+                
+    log = pd.DataFrame({
+        'epoch': epoch_log,
+        'step': step_log,
+        'train_loss': train_loss_log,
+        'eval_loss': eval_loss_log,
+        'perplexity': perplexity_log
+    })
+
+    log_path = os.path.join(cfg.output_dir, "train_log.csv")
+    log.to_csv(log_path, index=False)
+    print(f"Training log saved → {log_path}")
 
     
     final_dir = os.path.join(cfg.output_dir, "final")

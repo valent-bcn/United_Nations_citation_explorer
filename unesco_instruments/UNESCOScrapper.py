@@ -2,11 +2,14 @@ import os
 import re
 import json
 import time
+import random
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
@@ -30,7 +33,9 @@ class UNESCOScraper:
 
     # --- detail-page selectors -------------------------------------------------
     CATEGORY_CSS = "p.heading__content__type"
-    CONTENT_CSS = (
+    CONTENT_CSS = "#description"
+
+    FALLBACK_CONTENT_CSS = (
         "#block-unesco-content > article > div > "
         "div.dataset-template-wrapper > div > div.row.main-content > "
         "div.col-lg-9.content-wrapper > div:nth-child(2)"
@@ -38,17 +43,51 @@ class UNESCOScraper:
 
     DATALAYER_RE = re.compile(r"window\.dataLayer\.push\((\{.*?\})\);", re.DOTALL)
 
-
     # To avoid redundancy in the urls, we clean the ?hub=number from urls to standard the format
     STRIP_PARAMS = {"hub"}
 
-    def __init__(self, headless=True, timeout=30, request_delay=1.0):
+    def __init__(
+        self,
+        headless=True,
+        timeout=30,
+        request_delay=1.5,
+        delay_jitter=1.0,
+        max_retries=5,
+        backoff_factor=2.0,
+        detail_max_attempts=5,
+        detail_retry_wait=10.0,
+    ):
         self.headless = headless
         self.timeout = timeout
-        self.request_delay = request_delay
 
-        self.session = requests.Session()
-        self.session.headers.update({
+        # base delay between successful requests, plus a random jitter added
+        # on top so the pacing isn't perfectly regular / bot-like
+        self.request_delay = request_delay
+        self.delay_jitter = delay_jitter
+
+        # --- application-level retry knobs for fetch_details() ---------------
+        # These sit ABOVE the transport-level Retry below. The transport
+        # retries live inside a single requests.get() call and are silent
+        # (you never see them logged) and bounded by that one call's
+        # timeout budget. A handful of URLs still time out even after those
+        # internal retries are exhausted -- usually just a slow moment on
+        # the server, not a dead page -- so we retry the *whole* request a
+        # few more times, with a visible wait and a fresh connection.
+        self.detail_max_attempts = detail_max_attempts
+        self.detail_retry_wait = detail_retry_wait
+
+        # keep these around so _new_session() can rebuild an identical adapter
+        self._transport_max_retries = max_retries
+        self._transport_backoff_factor = backoff_factor
+
+        self.session = self._build_session()
+
+    # ------------------------------------------------------------------ #
+    # requests session (built once in __init__, rebuilt on retry)
+    # ------------------------------------------------------------------ #
+    def _build_session(self):
+        session = requests.Session()
+        session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -56,6 +95,47 @@ class UNESCOScraper:
             )
         })
 
+        # --- robust retry/backoff at the transport level ---------------------
+        # This handles 429 (rate limit) AND other transient failures
+        # (500/502/503/504, connection resets, read timeouts) uniformly,
+        # instead of hand-coding a check for one specific status code.
+        #
+        # - total=max_retries: how many times urllib3 will retry a request
+        # - backoff_factor: delay grows as {backoff_factor} * (2 ** (retry_count - 1))
+        #     e.g. with backoff_factor=2 -> 2s, 4s, 8s, 16s, 32s
+        # - status_forcelist: which HTTP status codes should trigger a retry
+        # - respect_retry_after_header=True: if the server sends a
+        #     `Retry-After` header (very common on 429s), urllib3 will sleep
+        #     for exactly that long instead of guessing
+        # - allowed_methods: retry GET (default excludes some methods; we're
+        #     only doing GETs here so this is safe)
+        retry_strategy = Retry(
+            total=self._transport_max_retries,
+            backoff_factor=self._transport_backoff_factor,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            respect_retry_after_header=True,
+            raise_on_status=False,  # let us inspect/handle the final response ourselves
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _new_session(self):
+        """
+        Replace self.session with a fresh one (same headers/retry policy).
+
+        A read timeout that survives urllib3's internal retries is often a
+        sign the underlying TCP connection is in a bad state (half-open,
+        stuck behind a proxy, etc.) rather than the URL itself being broken.
+        Starting a clean connection before the next attempt clears that up.
+        """
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._build_session()
 
     @classmethod
     def clean_url(cls, url):
@@ -66,6 +146,10 @@ class UNESCOScraper:
         kept = [(k, v) for k, v in parse_qsl(parts.query) if k not in cls.STRIP_PARAMS]
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
 
+    def _sleep_with_jitter(self, base=None):
+        """Sleep for `base` (default request_delay) seconds plus a random jitter."""
+        base = self.request_delay if base is None else base
+        time.sleep(base + random.uniform(0, self.delay_jitter))
 
     # ------------------------------------------------------------------ #
     # Selenium: results list page
@@ -156,7 +240,28 @@ class UNESCOScraper:
         except json.JSONDecodeError:
             return {}
 
-    def fetch_details(self, url):
+    def _parse_detail_html(self, html):
+        """Parse a fetched detail page's HTML into the category/uuid/content dict."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        data = self._parse_datalayer(html)
+        uuid = data.get("content", {}).get("uuid")
+
+        category = None
+        category_el = soup.select_one(self.CATEGORY_CSS)
+        if category_el:
+            category = category_el.get_text(strip=True)
+
+        content_el = soup.select_one(self.CONTENT_CSS)
+        if content_el:
+            content = content_el.get_text("\n", strip=True)
+        else:
+            fallback_el = soup.select_one(self.FALLBACK_CONTENT_CSS)
+            content = fallback_el.get_text("\n", strip=True) if fallback_el else None
+
+        return {"category": category, "uuid": uuid, "content": content}
+
+    def fetch_details(self, url, max_attempts=None, retry_wait=None):
         """
         Fetch a single instrument detail page and extract:
             - category : e.g. "Recommendation", "Convention", ...
@@ -164,45 +269,62 @@ class UNESCOScraper:
             - content  : plain-text body of the description section
 
         Returns a dict (usable as a pandas row); missing fields are None.
+
+        The Session's transport-level Retry adapter already absorbs
+        429/5xx/read-timeouts *within* a single requests.get() call. This
+        method adds a second, visible layer on top: if that call still ends
+        up failing (its retry budget exhausted), we wait `retry_wait`
+        seconds, swap in a fresh Session (to shake off any stuck
+        connection), and try the whole request again, up to `max_attempts`
+        times total.
         """
-        details = {
-            "category": None,
-            "uuid": None,
-            "content": None,
-        }
+        max_attempts = self.detail_max_attempts if max_attempts is None else max_attempts
+        retry_wait = self.detail_retry_wait if retry_wait is None else retry_wait
 
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  [WARN] could not fetch {url}: {e}")
-            return details
+        details = {"category": None, "uuid": None, "content": None}
 
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # give slow pages a little more room on later attempts
+                attempt_timeout = self.timeout + (attempt - 1) * 10
+                resp = self.session.get(url, timeout=attempt_timeout)
 
-        # --- uuid, via the dataLayer JSON blob ---
-        data = self._parse_datalayer(html)
-        details["uuid"] = data.get("content", {}).get("uuid")
+                if resp.status_code == 429:
+                    # Transport retries were exhausted and the server is
+                    # still rate-limiting us. Back off hard once more.
+                    retry_after = resp.headers.get("Retry-After")
+                    wait_s = float(retry_after) if retry_after else self.request_delay * 10
+                    print(f"  [WARN] still rate-limited (attempt {attempt}/{max_attempts}), "
+                          f"waiting {wait_s:.0f}s: {url}")
+                    time.sleep(wait_s)
+                    resp = self.session.get(url, timeout=attempt_timeout)
 
-        # --- category ---
-        category_el = soup.select_one(self.CATEGORY_CSS)
-        if category_el:
-            details["category"] = category_el.get_text(strip=True)
+                resp.raise_for_status()
 
-        # --- body content ---
-        content_el = soup.select_one(self.CONTENT_CSS)
-        details["content"] = (
-            content_el.get_text("\\n", strip=True) if content_el else None
-        )
+            except requests.RequestException as e:
+                print(f"  [WARN] attempt {attempt}/{max_attempts} failed for {url}: {e}")
+                if attempt == max_attempts:
+                    print(f"  [ERROR] giving up on {url} after {max_attempts} attempts")
+                    return details
+                time.sleep(retry_wait + random.uniform(0, self.delay_jitter))
+                self._new_session()
+                continue
 
-        return details
+            # success
+            return self._parse_detail_html(resp.text)
 
+        return details  # unreachable, kept for safety
 
-    def enrich(self, df):
+    def enrich(self, df, retry_failed_pass=True):
         """
         Calls fetch_details() for every row['url'] in df and returns a new
         dataframe with the original columns plus category/uuid/content.
+
+        If `retry_failed_pass` is True (default), any row that still has no
+        content after the main loop gets one more attempt at the very end,
+        after a cooldown wait. This catches pages that were having a bad
+        moment even across fetch_details()'s own internal retries -- giving
+        the site a longer break before trying again tends to clear these up.
         """
         rows = []
         total = len(df)
@@ -210,10 +332,33 @@ class UNESCOScraper:
         for i, url in enumerate(df["url"], start=1):
             print(f"[{i}/{total}] {url}")
             rows.append(self.fetch_details(url))
-            time.sleep(self.request_delay)
+            self._sleep_with_jitter()
 
         details_df = pd.DataFrame(rows)
-        return pd.concat([df.reset_index(drop=True), details_df], axis=1)
+        result = pd.concat([df.reset_index(drop=True), details_df], axis=1)
+
+        if retry_failed_pass:
+            failed_mask = result["content"].isna()
+            n_failed = int(failed_mask.sum())
+            if n_failed:
+                print(f"\n--- retry pass: {n_failed} row(s) with no content, "
+                      f"cooling down {self.detail_retry_wait:.0f}s before retrying ---")
+                time.sleep(self.detail_retry_wait)
+                self._new_session()
+
+                for idx in result.index[failed_mask]:
+                    url = result.at[idx, "url"]
+                    print(f"[retry] {url}")
+                    fresh = self.fetch_details(url)
+                    for col, val in fresh.items():
+                        result.at[idx, col] = val
+                    self._sleep_with_jitter()
+
+                still_failed = int(result["content"].isna().sum())
+                if still_failed:
+                    print(f"  [WARN] {still_failed} row(s) still have no content after the retry pass")
+
+        return result
 
 
 if __name__ == "__main__":
