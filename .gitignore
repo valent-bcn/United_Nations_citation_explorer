@@ -19,7 +19,7 @@ unesco_instruments/pdf_files/*.pdf
 ohchr_instruments/*.csv
 ohchr_instruments/*.txt
 ohchr_instruments/*.pdf
-#instruments/*.md
+ohchr_instruments/prior_parts/*.csv
 
 # resolutions
 resolutions/*.csv
