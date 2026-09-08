@@ -15,6 +15,7 @@ import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+from enum import Enum, auto
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,12 @@ def apply_filters(ohchr_df: pd.DataFrame) -> pd.DataFrame:
     # Remove report like resolutions e.g., A/C.3/74/L.31/Rev.1
     df = df[~df['Text number'].str.lower().str.contains('.', regex=False, na=False)]
 
+    df['Text number'] = (
+        df['Text number']
+        .astype(str)
+        .str.replace(r'^(\d+)/0*(\d+)$', r'\1/\2', regex=True)
+    )
+
     return df
 
 
@@ -92,8 +99,14 @@ def make_driver(download_dir: str) -> webdriver.Firefox:
     return driver
 
 # ---------------------------------------------------------------------------
-# DOWNLOAD HELPERS
+# DOWNLOAD HELPERS + DOWNLOAD STATUS
 # ---------------------------------------------------------------------------
+class DownloadStatus(Enum):
+    ALREADY_DOWNLOADED = auto()
+    DOWNLOADED = auto()
+    FAILED = auto()
+
+
 def snapshot_dir(download_dir: str) -> set:
     return set(os.listdir(download_dir))
 
@@ -122,13 +135,18 @@ def wait_for_new_download(download_dir: str, files_before: set, timeout: int = D
     return None
 
 
-def download_text(driver: webdriver.Firefox, text_number: str, download_dir: str) -> bool:
+def download_text(
+    driver: webdriver.Firefox,
+    text_number: str,
+    download_dir: str
+) -> DownloadStatus:
+
     target_filename = text_number.replace("/", "-") + ".pdf"
     target_path = os.path.join(download_dir, target_filename)
 
     if os.path.exists(target_path):
         print(f"[SKIP] {target_filename} already exists.")
-        return True
+        return DownloadStatus.ALREADY_DOWNLOADED
 
     url = BASE_URL + text_number
     print(f"[GET]  {text_number} -> {url}")
@@ -139,25 +157,27 @@ def download_text(driver: webdriver.Firefox, text_number: str, download_dir: str
         driver.get(url)
     except Exception as e:
         print(f"[ERROR] Could not load {url}: {e}")
-        return False
+        return DownloadStatus.FAILED
 
     downloaded_name = wait_for_new_download(download_dir, files_before)
 
     if downloaded_name is None:
         print(f"[FAIL] Timed out waiting for download of {text_number}")
-        return False
+        return DownloadStatus.FAILED
 
     downloaded_path = os.path.join(download_dir, downloaded_name)
 
-    # Rename to the requested convention (e.g. 65-20.pdf), regardless of
-    # whatever filename the server/Firefox originally used.
     try:
         os.replace(downloaded_path, target_path)
         print(f"[OK]   Saved as {target_filename}")
-        return True
+        return DownloadStatus.DOWNLOADED
+
     except Exception as e:
-        print(f"[ERROR] Could not rename {downloaded_name} -> {target_filename}: {e}")
-        return False
+        print(
+            f"[ERROR] Could not rename "
+            f"{downloaded_name} -> {target_filename}: {e}"
+        )
+        return DownloadStatus.FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +195,16 @@ def run(ohchr_df: pd.DataFrame):
     try:
         for i, text_number in enumerate(text_numbers, start=1):
             print(f"\n--- [{i}/{len(text_numbers)}] {text_number} ---")
-            download_text(driver, text_number, DOWNLOAD_DIR)
 
-            # Polite randomized wait before the next request (skip after the last one)
+            status = download_text(driver, text_number, DOWNLOAD_DIR)
+
             if i < len(text_numbers):
-                wait_time = random.uniform(MIN_WAIT_SECONDS, MAX_WAIT_SECONDS)
+
+                if status == DownloadStatus.ALREADY_DOWNLOADED:
+                    wait_time = random.uniform(0, 2)
+                else:
+                    wait_time = random.uniform(MIN_WAIT_SECONDS, MAX_WAIT_SECONDS)
+
                 print(f"Waiting {wait_time:.1f}s before next request...")
                 time.sleep(wait_time)
     finally:

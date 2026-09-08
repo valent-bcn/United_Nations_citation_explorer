@@ -17,7 +17,7 @@ from selenium.webdriver.support import expected_conditions as EC
 # ----------------------------
 # SETTINGS
 # ----------------------------
-INPUT_CSV = "./ohchr_instruments.csv"
+INPUT_CSV = "./prior_parts/ohchr_instruments.csv"
 OUTPUT_CSV = "./ohchr_instruments_detailed.csv"
 PDF_DIR = ""
 load_dotenv()
