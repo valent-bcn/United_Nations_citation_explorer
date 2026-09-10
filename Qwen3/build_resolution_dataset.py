@@ -3,7 +3,7 @@
 Build train/val/test JSONL datasets for UN resolution citation extraction.
 
 Usage:
-    python build_resolution_dataset.py                 # GA citations only
+    python build_resolution_dataset.py                 # GA citations only, enhanced
     python build_resolution_dataset.py --old            # use the legacy 1946-2019 GA citation file
     python build_resolution_dataset.py --sc             # also include Security Council citations
     python build_resolution_dataset.py --ohchr          # also include OHCHR citations
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 
 DEFAULT_DATA_DIR = Path(".")
-DEFAULT_OUTPUT_DIR = Path("../Qwen3/data/")
+DEFAULT_OUTPUT_DIR = Path("./data/")
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-8B"
 DEFAULT_MAX_TOKEN_LENGTH = 2846
 DEFAULT_TOKEN_SLACK = 30  # a trimmed candidate must fit within max_tokens + slack

@@ -36,6 +36,7 @@ conv-prot-rec/*.md
 
 # Qwen data
 Qwen3/data/
+Qwen3/checkpoints_silver_legacy/
 
 # OS files
 .DS_Store
