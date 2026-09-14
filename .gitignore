@@ -8,6 +8,7 @@ treaties/*.csv
 treaties/*.txt
 treaties/*.pdf
 treaties/*.md
+treaties/treaty-ner/*
 
 # unesco instruments
 unesco_instruments/*.csv
