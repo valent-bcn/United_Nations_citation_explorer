@@ -1,16 +1,66 @@
+"""
+ICU server version.
+Weakly-supervised NER pipeline for detecting treaty/convention names in UN
+General Assembly resolution text.
+
+Pipeline:
+    1. Build a lowercase alias -> entity_id lookup table from several treaty
+       reference tables (Wikipedia, OHCHR, UNO, UNESCO, conventions/protocols).
+    2. Use a spaCy PhraseMatcher over the resolution corpus to weakly label
+       spans that match a known alias ("known_docs"); resolutions with no
+       match are kept separately ("unknown_docs").
+    3. Convert the character-level spans from step 2 into token-level BIO
+       tags (B-TREATY / I-TREATY / O) for HF token classification.
+    4. Fine-tune a token classifier (default: bert-base-uncased) on the BIO
+       data with the HF Trainer, logging seqeval precision/recall/F1 to
+       stdout and to a CSV file in the training output directory at the end
+       of every epoch.
+    5. Build "silver" candidate spans on the unknown_docs using a rule-based
+       spaCy Matcher (lexical patterns like "treaty of ...", "convention on
+       ..."), then check how many of those candidates the fine-tuned model
+       also detects, as a rough proxy for how well it generalises beyond the
+       original alias list.
+"""
+
+import csv
+import os
 import re
+from functools import partial
+
+import numpy as np
 import pandas as pd
 import spacy
-from spacy.matcher import PhraseMatcher, Matcher
-from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+from datasets import Dataset
+from seqeval.metrics import (
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from spacy.matcher import Matcher, PhraseMatcher
+from transformers import (
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    DataCollatorForTokenClassification,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    pipeline,
+)
 
 nlp = spacy.load("en_core_web_sm")
+
+LABEL_LIST = ["O", "B-TREATY", "I-TREATY"]
+LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
+ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
+
 
 # ---------------------------------------------------------------------------
 # 1. ALIAS GENERATION PER ENTITY
 # ---------------------------------------------------------------------------
 
 def build_aliases(df_treaty: pd.DataFrame) -> dict:
+    """Build a {lowercase alias: entity_id} lookup from the treaty table."""
     aliases = {}
     for idx, row in df_treaty.iterrows():
         entity_id = idx
@@ -37,14 +87,14 @@ def build_aliases(df_treaty: pd.DataFrame) -> dict:
 
 def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
     """
-    df_res: columnas 'id', 'content'
-    Devuelve:
-      known_docs: lista de dicts {doc_id, text, spans: [(start_char, end_char, entity_id)]}
-      unknown_docs: lista de dicts {doc_id, text}  (sin ningún alias detectado)
+    df_res: columns 'id', 'content'.
+
+    Returns:
+        known_docs: list of dicts {doc_id, text, spans: [(start_char, end_char, entity_id)]}
+        unknown_docs: list of dicts {doc_id, text}  (no alias detected at all)
     """
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
     patterns = [nlp.make_doc(alias) for alias in aliases.keys()]
-    alias_list = list(aliases.keys())
     matcher.add("TREATY", patterns)
 
     known_docs, unknown_docs = [], []
@@ -59,11 +109,15 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
 
         spans = []
         seen = set()
-        matches_sorted = sorted(matches, key=lambda m: doc[m[1]:m[2]].end_char - doc[m[1]:m[2]].start_char, reverse=True)
+        matches_sorted = sorted(
+            matches,
+            key=lambda m: doc[m[1]:m[2]].end_char - doc[m[1]:m[2]].start_char,
+            reverse=True,
+        )
         for match_id, start, end in matches_sorted:
             span = doc[start:end]
             if any(span.start_char < s[1] and span.end_char > s[0] for s in seen):
-                continue  # se solapa con un match ya aceptado
+                continue  # overlaps with an already accepted match
             seen.add((span.start_char, span.end_char))
             alias_text = span.text.lower().strip()
             entity_id = aliases.get(alias_text)
@@ -80,15 +134,14 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
 
 def to_bio_examples(known_docs):
     """
-    Convierte cada doc con spans de caracteres a tokens + labels BIO,
-    usando el tokenizador de spaCy para el split (luego se realinea con
-    el tokenizador del modelo en el Dataset.map).
+    Convert each doc's character-level spans into tokens + BIO labels,
+    using spaCy's tokenizer for the split (this gets realigned to the
+    model's own tokenizer later, in align_labels / Dataset.map).
     """
     examples = []
     for d in known_docs:
         doc = nlp(d["text"])
         labels = ["O"] * len(doc)
-        char_to_tok = {tok.idx: tok.i for tok in doc}
 
         for start, end, _entity_id in d["spans"]:
             span = doc.char_span(start, end, alignment_mode="expand")
@@ -110,113 +163,149 @@ def to_bio_examples(known_docs):
 # 4. TOKEN CLASSIFIER FINE-TUNING (HF Trainer)
 # ---------------------------------------------------------------------------
 
-def train_token_classifier(bio_examples, model_name="bert-base-uncased"):
-    import numpy as np
-    from datasets import Dataset
-    from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
-    from transformers import (
-        AutoTokenizer, AutoModelForTokenClassification,
-        DataCollatorForTokenClassification, TrainingArguments, Trainer,
-    )
+def align_labels(example, tokenizer, label2id=LABEL2ID):
+    """
+    Tokenize with the model's tokenizer and realign word-level BIO labels
+    to subword tokens. Subword continuations keep I-TREATY if the parent
+    word was tagged, otherwise O; special tokens get -100 so they're
+    ignored by the loss and by seqeval.
+    """
+    tokenized = tokenizer(example["tokens"], is_split_into_words=True, truncation=True)
+    word_ids = tokenized.word_ids()
+    aligned = []
+    prev_word = None
+    for wid in word_ids:
+        if wid is None:
+            aligned.append(-100)
+        elif wid != prev_word:
+            aligned.append(label2id[example["ner_tags"][wid]])
+        else:
+            tag = example["ner_tags"][wid]
+            aligned.append(label2id["I-TREATY"] if tag != "O" else label2id["O"])
+        prev_word = wid
+    tokenized["labels"] = aligned
+    return tokenized
 
-    label_list = ["O", "B-TREATY", "I-TREATY"]
-    label2id = {l: i for i, l in enumerate(label_list)}
-    id2label = {i: l for i, l in enumerate(label_list)}
 
-    def compute_metrics(eval_pred):
-        # eval_pred is an EvalPrediction: (logits, label_ids)
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=2)
+def compute_metrics(eval_pred, id2label=ID2LABEL):
+    """Compute seqeval precision/recall/F1 from an HF EvalPrediction."""
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=2)
 
-        true_labels, true_preds = [], []
-        for pred_row, label_row in zip(preds, labels):
-            seq_labels, seq_preds = [], []
-            for p, l in zip(pred_row, label_row):
-                if l == -100:          # ignore padding / subword-continuation tokens
-                    continue
-                seq_labels.append(id2label[l])
-                seq_preds.append(id2label[p])
-            true_labels.append(seq_labels)
-            true_preds.append(seq_preds)
+    true_labels, true_preds = [], []
+    for pred_row, label_row in zip(preds, labels):
+        seq_labels, seq_preds = [], []
+        for p, l in zip(pred_row, label_row):
+            if l == -100:  # ignore padding / subword-continuation tokens
+                continue
+            seq_labels.append(id2label[l])
+            seq_preds.append(id2label[p])
+        true_labels.append(seq_labels)
+        true_preds.append(seq_preds)
 
-        # printed to stdout at every eval call (i.e. every epoch), not just returned
-        print(classification_report(true_labels, true_preds))
+    # printed to stdout at every eval call (i.e. every epoch), not just returned
+    print(classification_report(true_labels, true_preds))
 
-        return {
-            "precision": precision_score(true_labels, true_preds),
-            "recall": recall_score(true_labels, true_preds),
-            "f1": f1_score(true_labels, true_preds),
-        }
+    return {
+        "precision": precision_score(true_labels, true_preds),
+        "recall": recall_score(true_labels, true_preds),
+        "f1": f1_score(true_labels, true_preds),
+    }
 
+
+class MetricsCSVLogger(TrainerCallback):
+    """
+    Trainer callback that appends the eval metrics dict to a CSV file inside
+    the run's output directory every time evaluation runs (i.e. at the end
+    of each epoch, given eval_strategy="epoch").
+    """
+
+    def __init__(self, output_dir, filename="eval_metrics.csv"):
+        os.makedirs(output_dir, exist_ok=True)
+        self.csv_path = os.path.join(output_dir, filename)
+        self._header_written = False
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        row = {"epoch": state.epoch, **{k: v for k, v in metrics.items() if isinstance(v, (int, float))}}
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not self._header_written:
+                writer.writeheader()
+                self._header_written = True
+            writer.writerow(row)
+
+
+def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_dir="./treaty-ner"):
+    """
+    Fine-tune a token classification model to detect TREATY spans with the
+    HF Trainer. Per-epoch seqeval metrics are printed to stdout and appended
+    to <output_dir>/eval_metrics.csv via MetricsCSVLogger.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    def align_labels(example):
-        tokenized = tokenizer(example["tokens"], is_split_into_words=True, truncation=True)
-        word_ids = tokenized.word_ids()
-        aligned = []
-        prev_word = None
-        for wid in word_ids:
-            if wid is None:
-                aligned.append(-100)
-            elif wid != prev_word:
-                aligned.append(label2id[example["ner_tags"][wid]])
-            else:
-                # subword continuation: mantiene I- si corresponde, o -100 si preferís ignorarlo
-                tag = example["ner_tags"][wid]
-                aligned.append(label2id["I-TREATY"] if tag != "O" else label2id["O"])
-            prev_word = wid
-        tokenized["labels"] = aligned
-        return tokenized
 
     ds = Dataset.from_list(bio_examples)
     ds = ds.train_test_split(test_size=0.15, seed=42)
-    ds = ds.map(align_labels, remove_columns=["tokens", "ner_tags", "doc_id"])
+    ds = ds.map(
+        partial(align_labels, tokenizer=tokenizer),
+        remove_columns=["tokens", "ner_tags", "doc_id"],
+    )
 
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name, num_labels=len(label_list), id2label=id2label, label2id=label2id
+        model_name, num_labels=len(LABEL_LIST), id2label=ID2LABEL, label2id=LABEL2ID
     )
     collator = DataCollatorForTokenClassification(tokenizer)
 
     args = TrainingArguments(
-        output_dir="./treaty-ner",
+        output_dir=output_dir,
         eval_strategy="epoch",
         save_strategy="epoch",
-        logging_strategy="epoch",       # print train loss at each epoch too, for comparison
+        save_total_limit=2,  # don't fill the disk with a checkpoint every epoch
+        logging_strategy="epoch",
         learning_rate=2e-5,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=32,  # was 1 — bump way up, GPU memory allowing
+        per_device_eval_batch_size=64,  # eval doesn't need grads, can go higher than train
+        gradient_accumulation_steps=1,  # raise this instead of batch size if you hit OOM
+        dataloader_num_workers=4,  # parallel batch loading, keeps GPU fed
+        group_by_length=True,  # buckets similar-length sequences -> less padding waste
+        fp16=True,  # or bf16=True on Ampere+ (A100, RTX 30/40xx, H100)
         num_train_epochs=8,
         weight_decay=0.005,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",     # which of the compute_metrics keys decides "best"
+        metric_for_best_model="f1",
         greater_is_better=True,
     )
 
     trainer = Trainer(
-        model=model, args=args,
-        train_dataset=ds["train"], eval_dataset=ds["test"],
-        data_collator=collator, processing_class=tokenizer,
-        compute_metrics=compute_metrics,   # <-- this is what triggers seqeval metrics each epoch
+        model=model,
+        args=args,
+        train_dataset=ds["train"],
+        eval_dataset=ds["test"],
+        data_collator=collator,
+        processing_class=tokenizer,
+        compute_metrics=compute_metrics,        # <-- triggers seqeval metrics each epoch
+        callbacks=[MetricsCSVLogger(output_dir)],  # <-- writes those metrics to CSV each epoch
     )
     trainer.train()
 
-    # trainer.state.log_history has a per-epoch record of eval_precision/eval_recall/eval_f1
-    # if you want to plot the evolution afterward, e.g.:
-    #   import pandas as pd
+    # trainer.state.log_history also has a per-epoch record of eval_precision/eval_recall/eval_f1
+    # if you want to plot the evolution afterward in-memory instead of re-reading the CSV, e.g.:
     #   hist = pd.DataFrame(trainer.state.log_history)
     #   hist[hist["eval_f1"].notna()][["epoch", "eval_precision", "eval_recall", "eval_f1"]]
 
-    return trainer, tokenizer, id2label
+    return trainer, tokenizer, ID2LABEL
 
 
 # ---------------------------------------------------------------------------
-# 5. "SILVER" TEST SET ON DOCS WITHOUT ANY KNOWN MATCH (regex/reglas)
+# 5. "SILVER" TEST SET ON DOCS WITHOUT ANY KNOWN MATCH (regex/rules)
 # ---------------------------------------------------------------------------
 
 def build_silver_candidates(unknown_docs):
     """
-    Detecta candidatos a tratado/convención por patrón léxico en docs donde
-    el gazetteer NO encontró nada. Sirve para medir si el modelo generaliza
-    a nombres fuera de la lista original.
+    Detect treaty/convention candidates via lexical pattern in docs where
+    the gazetteer found NO match. Used to measure whether the model
+    generalises to names outside the original alias list.
     """
     matcher = Matcher(nlp.vocab)
     keywords = ["treaty", "convention", "agreement", "pact", "protocol", "charter"]
@@ -254,8 +343,8 @@ def build_silver_candidates(unknown_docs):
 # ---------------------------------------------------------------------------
 
 def evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_df):
-    from transformers import pipeline
-
+    """For each silver candidate span, check whether the fine-tuned model's
+    NER pipeline predicted an overlapping span, and report the hit rate."""
     ner_pipe = pipeline(
         "ner", model=trainer.model, tokenizer=tokenizer,
         aggregation_strategy="simple",
@@ -277,8 +366,9 @@ def evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_d
     print(f"Recall proxy over silver candidates (not seen in training): {recall_proxy:.2%}")
     return result_df
 
+
 def evaluate_test_split(trainer, tokenizer, id2label, test_dataset, raw_test_examples):
-    import numpy as np
+    """Run trainer.predict on the held-out test split and print/return seqeval metrics."""
     predictions, labels, _ = trainer.predict(test_dataset)
     preds = np.argmax(predictions, axis=2)
 
@@ -300,35 +390,35 @@ def evaluate_test_split(trainer, tokenizer, id2label, test_dataset, raw_test_exa
         "f1": f1_score(true_labels, true_preds),
     }
 
+
 # ---------------------------------------------------------------------------
 # DATA LOAD & RUN
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    df_res = pd.read_csv("../resolutions/ga_resolutions_1946_2019.csv")
+    df_res = pd.read_csv("/home/user/branes/NER-data/ga_resolutions_1946_2019.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
-    df_res = df_res.tail(500)
 
     cols = ["title", "year", "alternative_name"]
 
-    df_wiki = pd.read_csv("./wiki-treaties_formatted.csv")
+    df_wiki = pd.read_csv("/home/user/branes/NER-data/wiki-treaties_formatted.csv")
 
-    df_ohchr = pd.read_csv("../ohchr_instruments/ohchr_instruments_detailed-instit.csv")
+    df_ohchr = pd.read_csv("/home/user/branes/NER-data/ohchr_instruments_detailed-instit.csv")
     df_ohchr["year"] = pd.to_datetime(df_ohchr["adoption_date"], format="%d %B %Y").dt.year
 
     df_wiki = df_wiki.rename(columns={"name": "title", "cleaned_note": "alternative_name"})[cols]
 
-    df_ohchr["alternative_name"] = ""  #It does not have an alias column, we set this as null
+    df_ohchr["alternative_name"] = ""  # it does not have an alias column, we set this as null
     df_ohchr = df_ohchr[cols]
 
-    df_uno = pd.read_csv("../treaties/UNO-Treaties.csv")
+    df_uno = pd.read_csv("/home/user/branes/NER-data/UNO-Treaties.csv")
     df_uno["year"] = pd.to_datetime(df_uno["date"], format="%d %B %Y").dt.year
     df_uno["alternative_name"] = ""
 
-    df_unesco = pd.read_csv("../unesco_instruments/UNESCO_legal_instruments_detail.csv")
+    df_unesco = pd.read_csv("/home/user/branes/NER-data/UNESCO_legal_instruments_detail.csv")
     df_unesco["year"] = pd.to_datetime(df_unesco["date"], format="%d %B %Y").dt.year
     df_unesco["alternative_name"] = ""
 
-    df_conv_prot_rec = pd.read_csv("../conv-prot-rec/conventions-protocols-recommendations.csv")
+    df_conv_prot_rec = pd.read_csv("/home/user/branes/NER-data/conventions-protocols-recommendations.csv")
     df_conv_prot_rec["alternative_name"] = ""
 
     df_treaty = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
@@ -344,4 +434,3 @@ if __name__ == "__main__":
     silver_df = build_silver_candidates(unknown_docs)
     if not silver_df.empty:
         evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_df)
-
