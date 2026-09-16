@@ -21,7 +21,7 @@ from sentence_transformers import SentenceTransformer
 # ----------------------------
 # SETTINGS
 # ----------------------------
-BASE_DIR = "./"
+BASE_DIR = "./document_embeddings/"
 INDEX_PATH = BASE_DIR + "faiss_docs_resolutions.bin"
 METADATA_PATH = BASE_DIR + "faiss_docs_resolutions.npy"
 MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
