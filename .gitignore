@@ -10,6 +10,9 @@ treaties/*.pdf
 treaties/*.md
 treaties/treaty-ner/*
 
+# instruments (NER)
+instrument-ner/checkpoints/*
+
 # unesco instruments
 unesco_instruments/*.csv
 unesco_instruments/*.zip

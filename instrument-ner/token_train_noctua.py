@@ -246,7 +246,7 @@ def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     ds = Dataset.from_list(bio_examples)
-    ds = ds.train_test_split(test_size=0.15, seed=42)
+    ds = ds.train_test_split(test_size=0.15, seed=42, shuffle=True)
     ds = ds.map(
         partial(align_labels, tokenizer=tokenizer),
         remove_columns=["tokens", "ner_tags", "doc_id"],

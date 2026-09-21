@@ -1,25 +1,27 @@
 """
-Weakly-supervised NER pipeline for detecting treaty/convention names in UN
+Weakly-supervised NER pipeline for detecting instrument/convention/protocol names in UN
 General Assembly resolution text.
 
 Pipeline:
-    1. Build a lowercase alias -> entity_id lookup table from several treaty
+    1. Build a lowercase alias -> entity_id lookup table from several instrument
        reference tables (Wikipedia, OHCHR, UNO, UNESCO, conventions/protocols).
     2. Use a spaCy PhraseMatcher over the resolution corpus to weakly label
        spans that match a known alias ("known_docs"); resolutions with no
        match are kept separately ("unknown_docs").
     3. Convert the character-level spans from step 2 into token-level BIO
-       tags (B-TREATY / I-TREATY / O) for HF token classification.
+       tags (B-INSTRUMENT / I-INSTRUMENT / O) for HF token classification.
     4. Fine-tune a token classifier (default: bert-base-uncased) on the BIO
        data with the HF Trainer, logging seqeval precision/recall/F1 to
        stdout and to a CSV file in the training output directory at the end
        of every epoch.
     5. Build "silver" candidate spans on the unknown_docs using a rule-based
-       spaCy Matcher (lexical patterns like "treaty of ...", "convention on
-       ..."), then check how many of those candidates the fine-tuned model
+       spaCy Matcher (lexical patterns like "treaty/convention/pact of ...",
+       then check how many of those candidates the fine-tuned model
        also detects, as a rough proxy for how well it generalises beyond the
        original alias list.
 """
+#TODO: Repeat the train with the extended dataset of DICED (SpiritRAG) update with the instruments found in UNKOWN
+#TODO: No tenemos que invalidar las metricas, la eleccion de tener un UNKWON .KNOWN tiene que ser bien pensada
 
 import csv
 import os
@@ -49,7 +51,7 @@ from transformers import (
 
 nlp = spacy.load("en_core_web_sm")
 
-LABEL_LIST = ["O", "B-TREATY", "I-TREATY"]
+LABEL_LIST = ["O", "B-INSTRUMENT", "I-INSTRUMENT"]
 LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
 ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
@@ -58,27 +60,31 @@ ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 # 1. ALIAS GENERATION PER ENTITY
 # ---------------------------------------------------------------------------
 
-def build_aliases(df_treaty: pd.DataFrame) -> dict:
-    """Build a {lowercase alias: entity_id} lookup from the treaty table."""
+def build_aliases(df_instrument: pd.DataFrame) -> dict:
+    """
+    Build a {lowercase alias: alias_id} lookup from the instrument table.
+
+    Each alias are considered as different forms of titles. Here aliases are
+    not variation such as just changing the year position of the title or
+    just a switch of two words.
+    In any case, this helper serves the NER, not the Entity Linking,
+    Which belongs to a further phase.
+    """
     aliases = {}
-    for idx, row in df_treaty.iterrows():
-        entity_id = idx
-        variants = {row["title"]}
+    for idx, row in df_instrument.iterrows():
+        variants = list(dict.fromkeys(
+            [row["title"]] +
+            (
+                [p.strip() for p in row["alternative_name"].split(";") if p.strip()]
+                if pd.notna(row.get("alternative_name")) else []
+            )
+        ))
 
-        alt = row.get("alternative_name")
-        if pd.notna(alt):
-            for part in alt.split(";"):
-                v = part.strip()
-                if v:
-                    variants.add(v)
-        for v in list(variants):
-            no_year = re.sub(r"\s*\(?\b(18|19|20)\d{2}\b\)?", "", v).strip()
-            if no_year and no_year != v:
-                variants.add(no_year)
-        for v in variants:
-            aliases[v.lower().strip()] = entity_id
+        for i, v in enumerate(variants):
+            alias_id = f"{idx}::{i}"
+            aliases[v.lower().strip()] = alias_id
+
     return aliases
-
 
 # ---------------------------------------------------------------------------
 # 2. WEAK LABELING WITH PhraseMatcher
@@ -94,7 +100,7 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
     """
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
     patterns = [nlp.make_doc(alias) for alias in aliases.keys()]
-    matcher.add("TREATY", patterns)
+    matcher.add("INSTRUMENT", patterns)
 
     known_docs, unknown_docs = [], []
 
@@ -119,8 +125,8 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
                 continue  # overlaps with an already accepted match
             seen.add((span.start_char, span.end_char))
             alias_text = span.text.lower().strip()
-            entity_id = aliases.get(alias_text)
-            spans.append((span.start_char, span.end_char, entity_id))
+            alias_id = aliases.get(alias_text)
+            spans.append((span.start_char, span.end_char, alias_id))
 
         known_docs.append({"doc_id": row["id"], "text": row["content"], "spans": spans})
 
@@ -146,9 +152,9 @@ def to_bio_examples(known_docs):
             span = doc.char_span(start, end, alignment_mode="expand")
             if span is None:
                 continue
-            labels[span.start] = "B-TREATY"
+            labels[span.start] = "B-INSTRUMENT"
             for i in range(span.start + 1, span.end):
-                labels[i] = "I-TREATY"
+                labels[i] = "I-INSTRUMENT"
 
         examples.append({
             "doc_id": d["doc_id"],
@@ -165,7 +171,7 @@ def to_bio_examples(known_docs):
 def align_labels(example, tokenizer, label2id=LABEL2ID):
     """
     Tokenize with the model's tokenizer and realign word-level BIO labels
-    to subword tokens. Subword continuations keep I-TREATY if the parent
+    to subword tokens. Subword continuations keep I-INSTRUMENT if the parent
     word was tagged, otherwise O; special tokens get -100 so they're
     ignored by the loss and by seqeval.
     """
@@ -180,7 +186,7 @@ def align_labels(example, tokenizer, label2id=LABEL2ID):
             aligned.append(label2id[example["ner_tags"][wid]])
         else:
             tag = example["ner_tags"][wid]
-            aligned.append(label2id["I-TREATY"] if tag != "O" else label2id["O"])
+            aligned.append(label2id["I-INSTRUMENT"] if tag != "O" else label2id["O"])
         prev_word = wid
     tokenized["labels"] = aligned
     return tokenized
@@ -236,16 +242,18 @@ class MetricsCSVLogger(TrainerCallback):
             writer.writerow(row)
 
 
-def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_dir="./treaty-ner"):
+def train_token_classifier(bio_examples,
+                           model_name="bert-base-uncased",
+                           output_dir="./checkpoints/"):
     """
-    Fine-tune a token classification model to detect TREATY spans with the
+    Fine-tune a token classification model to detect INSTRUMENT spans with the
     HF Trainer. Per-epoch seqeval metrics are printed to stdout and appended
     to <output_dir>/eval_metrics.csv via MetricsCSVLogger.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     ds = Dataset.from_list(bio_examples)
-    ds = ds.train_test_split(test_size=0.15, seed=42)
+    ds = ds.train_test_split(test_size=0.15, seed=42, shuffle=True)
     ds = ds.map(
         partial(align_labels, tokenizer=tokenizer),
         remove_columns=["tokens", "ner_tags", "doc_id"],
@@ -263,7 +271,7 @@ def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_
         logging_strategy="epoch",       # print train loss at each epoch too, for comparison
         learning_rate=2e-5,
         per_device_train_batch_size=1,
-        num_train_epochs=8,
+        num_train_epochs=10,
         weight_decay=0.005,
         load_best_model_at_end=True,
         metric_for_best_model="f1",     # which of the compute_metrics keys decides "best"
@@ -296,20 +304,20 @@ def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_
 
 def build_silver_candidates(unknown_docs):
     """
-    Detect treaty/convention candidates via lexical pattern in docs where
+    Detect treaty/agreement/convention candidates via lexical pattern in docs where
     the gazetteer found NO match. Used to measure whether the model
     generalises to names outside the original alias list.
     """
     matcher = Matcher(nlp.vocab)
-    keywords = ["treaty", "convention", "agreement", "pact", "protocol", "charter"]
+    keywords = ["treaty", "convention", "agreement", "pact", "protocol", "charter", "declaration"]
     pattern = [
         {"LOWER": {"IN": keywords}},
-        {"LOWER": {"IN": ["of", "on", "of the"]}, "OP": "?"},
+        {"LOWER": {"IN": ["of", "on"]}, "OP": "?"},
         {"IS_ALPHA": True, "OP": "+"},
         {"LOWER": {"IN": ["in", "of"]}, "OP": "?"},
         {"POS": "PROPN", "OP": "+"},
     ]
-    matcher.add("TREATY_LIKE", [pattern])
+    matcher.add("INSTRUMENT_LIKE", [pattern])
 
     silver = []
     for d in unknown_docs:
@@ -390,11 +398,11 @@ def evaluate_test_split(trainer, tokenizer, id2label, test_dataset, raw_test_exa
 if __name__ == "__main__":
     df_res = pd.read_csv("../resolutions/ga_resolutions_1946_2019.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
-    df_res = df_res.tail(500)
+    df_res = df_res.tail(100)
 
     cols = ["title", "year", "alternative_name"]
 
-    df_wiki = pd.read_csv("./wiki-treaties_formatted.csv")
+    df_wiki = pd.read_csv("../treaties/wiki-treaties_formatted.csv")
 
     df_ohchr = pd.read_csv("../ohchr_instruments/ohchr_instruments_detailed-instit.csv")
     df_ohchr["year"] = pd.to_datetime(df_ohchr["adoption_date"], format="%d %B %Y").dt.year
@@ -415,10 +423,10 @@ if __name__ == "__main__":
     df_conv_prot_rec = pd.read_csv("../conv-prot-rec/conventions-protocols-recommendations.csv")
     df_conv_prot_rec["alternative_name"] = ""
 
-    df_treaty = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
-    df_treaty.drop_duplicates(inplace=True)
+    df_instrument = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
+    df_instrument.drop_duplicates(inplace=True)
 
-    aliases = build_aliases(df_treaty)
+    aliases = build_aliases(df_instrument)
     known_docs, unknown_docs = weak_label_corpus(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
@@ -428,3 +436,12 @@ if __name__ == "__main__":
     silver_df = build_silver_candidates(unknown_docs)
     if not silver_df.empty:
         evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_df)
+
+        review_df = (
+            silver_df
+            .drop_duplicates(subset="candidate_span")
+            .assign(decision="", notes="")  # empty columns for you to fill in during review
+            .sort_values("candidate_span")
+        )
+
+        review_df.to_csv("./silver_candidates_for_review.csv", index=False)
