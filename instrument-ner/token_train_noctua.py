@@ -404,5 +404,5 @@ if __name__ == "__main__":
     known_docs, unknown_docs = get_or_build_partition(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
-    #bio_examples = to_bio_examples(known_docs)
-    #trainer, tokenizer, id2label = train_token_classifier(bio_examples)
+    bio_examples = to_bio_examples(known_docs)
+    trainer, tokenizer, id2label = train_token_classifier(bio_examples)

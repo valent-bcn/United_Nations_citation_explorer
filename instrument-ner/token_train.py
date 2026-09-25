@@ -21,7 +21,6 @@ Pipeline:
        original alias list.
 """
 #TODO: Repeat the train with the extended dataset of DICED (SpiritRAG) update with the instruments found in UNKOWN
-#TODO: No tenemos que invalidar las metricas, la eleccion de tener un UNKWON .KNOWN tiene que ser bien pensada
 
 import csv
 import os
@@ -393,14 +392,14 @@ if __name__ == "__main__":
         df_uno["date"], format="%d %B %Y"
     ).dt.year
     df_uno["alternative_name"] = ""
-    df_uno = df_uno.rename(columns={"name": "title"})[cols]
+    df_uno = df_uno[cols]
 
     df_unesco = pd.read_csv("../unesco_instruments/UNESCO_legal_instruments_detail.csv")
     df_unesco["year"] = pd.to_datetime(
         df_unesco["date"], format="%d %B %Y"
     ).dt.year
     df_unesco["alternative_name"] = ""
-    df_unesco = df_unesco.rename(columns={"name": "title"})[cols]
+    df_unesco = df_unesco[cols]
 
     df_conv_prot_rec = pd.read_csv(
         "../conv-prot-rec/conventions-protocols-recommendations.csv"

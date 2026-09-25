@@ -38,8 +38,8 @@ from gliner import GLiNER
 BERT_CHECKPOINT_DIR = "./checkpoints/checkpoint-1792"
 BERT_SCORE_THRESHOLD = 0.90
 
-GLINER_MODEL_NAME = "urchade/gliner_small-v2.1"  # TODO: change to large as 'urchade/gliner_large-v2.1'
-GLINER_SCORE_THRESHOLD = 0.80
+GLINER_MODEL_NAME = "urchade/gliner_small-v2.1"
+GLINER_SCORE_THRESHOLD = 0.85
 TAGS = ["treaty", "convention", "agreement", "pact", "protocol", "charter", "declaration"]
 
 KNOWN_PARTITION_PATH = "./data/partition/partition_known.csv"
