@@ -48,6 +48,8 @@ from transformers import (
     TrainingArguments,
     pipeline,
 )
+import json
+from pathlib import Path
 
 nlp = spacy.load("en_core_web_sm")
 
@@ -132,6 +134,72 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
 
     return known_docs, unknown_docs
 
+
+def save_partition(known_docs, unknown_docs, out_dir="./data/partition"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # known docs: serialize spans (list of tuples) as JSON so they survive the round trip
+    known_rows = [
+        {
+            "doc_id": d["doc_id"],
+            "text": d["text"],
+            "spans": json.dumps(d["spans"]),
+        }
+        for d in known_docs
+    ]
+
+    known_df = pd.DataFrame(known_rows, columns=["doc_id", "text", "spans"])
+    known_path = os.path.join(out_dir, "partition_known.csv")
+    known_df.to_csv(known_path, index=False)
+
+    # unknown docs: no spans, just id + text
+    unknown_rows = [{"doc_id": d["doc_id"], "text": d["text"]} for d in unknown_docs]
+    unknown_df = pd.DataFrame(unknown_rows, columns=["doc_id", "text"])
+    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_df.to_csv(unknown_path, index=False)
+
+    return known_path, unknown_path
+
+def partition_exists(out_dir="./data/partition"):
+    known_path = os.path.join(out_dir, "partition_known.csv")
+    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    return os.path.exists(known_path) and os.path.exists(unknown_path)
+
+
+def load_partition(out_dir="./data/partition"):
+    known_path = os.path.join(out_dir, "partition_known.csv")
+    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+
+    known_df = pd.read_csv(known_path)
+    unknown_df = pd.read_csv(unknown_path)
+
+    # spans were json.dumps'd from a list of tuples -> come back as list of lists,
+    # so cast each span back to a tuple to match what weak_label_corpus originally produced
+    known_docs = [
+        {
+            "doc_id": row["doc_id"],
+            "text": row["text"],
+            "spans": [tuple(span) for span in json.loads(row["spans"])],
+        }
+        for _, row in known_df.iterrows()
+    ]
+
+    unknown_docs = [
+        {"doc_id": row["doc_id"], "text": row["text"]}
+        for _, row in unknown_df.iterrows()
+    ]
+
+    return known_docs, unknown_docs
+
+def get_or_build_partition(df_res, aliases, out_dir="./data/partition"):
+    if partition_exists(out_dir):
+        print(f"Found existing partition in {out_dir}, loading from disk...")
+        known_docs, unknown_docs = load_partition(out_dir)
+    else:
+        print("No existing partition found, running weak_label_corpus...")
+        known_docs, unknown_docs = weak_label_corpus(df_res, aliases)
+        save_partition(known_docs, unknown_docs, out_dir)
+    return known_docs, unknown_docs
 
 # ---------------------------------------------------------------------------
 # 3. SETTING BIO TAGS (formatting HF token classification)
@@ -299,100 +367,6 @@ def train_token_classifier(bio_examples,
 
 
 # ---------------------------------------------------------------------------
-# 5. "SILVER" TEST SET ON DOCS WITHOUT ANY KNOWN MATCH (regex/rules)
-# ---------------------------------------------------------------------------
-
-def build_silver_candidates(unknown_docs):
-    """
-    Detect treaty/agreement/convention candidates via lexical pattern in docs where
-    the gazetteer found NO match. Used to measure whether the model
-    generalises to names outside the original alias list.
-    """
-    matcher = Matcher(nlp.vocab)
-    keywords = ["treaty", "convention", "agreement", "pact", "protocol", "charter", "declaration"]
-    pattern = [
-        {"LOWER": {"IN": keywords}},
-        {"LOWER": {"IN": ["of", "on"]}, "OP": "?"},
-        {"IS_ALPHA": True, "OP": "+"},
-        {"LOWER": {"IN": ["in", "of"]}, "OP": "?"},
-        {"POS": "PROPN", "OP": "+"},
-    ]
-    matcher.add("INSTRUMENT_LIKE", [pattern])
-
-    silver = []
-    for d in unknown_docs:
-        doc = nlp(d["text"])
-
-        for sent in doc.sents:
-            matches = matcher(sent)
-
-            for match_id, start, end in matches:
-                span = sent[start:end]
-
-                silver.append({
-                    "doc_id": d["doc_id"],
-                    "text": d["text"],
-                    "candidate_span": span.text,
-                    "start_char": span.start_char,
-                    "end_char": span.end_char,
-                })
-    return pd.DataFrame(silver)
-
-
-# ---------------------------------------------------------------------------
-# 6. EVALUATE THE GENERALISATION: Run the model on unknown_docs and check the predictions against the silver set.
-# ---------------------------------------------------------------------------
-
-def evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_df):
-    """For each silver candidate span, check whether the fine-tuned model's
-    NER pipeline predicted an overlapping span, and report the hit rate."""
-    ner_pipe = pipeline(
-        "ner", model=trainer.model, tokenizer=tokenizer,
-        aggregation_strategy="simple",
-    )
-
-    rows = []
-    for d in unknown_docs:
-        preds = ner_pipe(d["text"])
-        gold_spans = silver_df[silver_df["doc_id"] == d["doc_id"]]
-        for _, g in gold_spans.iterrows():
-            hit = any(
-                p["start"] < g["end_char"] and p["end"] > g["start_char"]
-                for p in preds
-            )
-            rows.append({"doc_id": d["doc_id"], "candidate": g["candidate_span"], "detected_by_model": hit})
-
-    result_df = pd.DataFrame(rows)
-    recall_proxy = result_df["detected_by_model"].mean() if len(result_df) else float("nan")
-    print(f"Recall proxy over silver candidates (not seen in training): {recall_proxy:.2%}")
-    return result_df
-
-
-def evaluate_test_split(trainer, tokenizer, id2label, test_dataset, raw_test_examples):
-    """Run trainer.predict on the held-out test split and print/return seqeval metrics."""
-    predictions, labels, _ = trainer.predict(test_dataset)
-    preds = np.argmax(predictions, axis=2)
-
-    true_labels, true_preds = [], []
-    for pred_row, label_row in zip(preds, labels):
-        seq_labels, seq_preds = [], []
-        for p, l in zip(pred_row, label_row):
-            if l == -100:
-                continue
-            seq_labels.append(id2label[l])
-            seq_preds.append(id2label[p])
-        true_labels.append(seq_labels)
-        true_preds.append(seq_preds)
-
-    print(classification_report(true_labels, true_preds))
-    return {
-        "precision": precision_score(true_labels, true_preds),
-        "recall": recall_score(true_labels, true_preds),
-        "f1": f1_score(true_labels, true_preds),
-    }
-
-
-# ---------------------------------------------------------------------------
 # DATA LOAD & RUN
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -403,45 +377,45 @@ if __name__ == "__main__":
     cols = ["title", "year", "alternative_name"]
 
     df_wiki = pd.read_csv("../treaties/wiki-treaties_formatted.csv")
+    df_wiki = df_wiki.rename(
+        columns={"name": "title", "cleaned_note": "alternative_name"}
+    )[cols]
 
     df_ohchr = pd.read_csv("../ohchr_instruments/ohchr_instruments_detailed-instit.csv")
-    df_ohchr["year"] = pd.to_datetime(df_ohchr["adoption_date"], format="%d %B %Y").dt.year
-
-    df_wiki = df_wiki.rename(columns={"name": "title", "cleaned_note": "alternative_name"})[cols]
-
-    df_ohchr["alternative_name"] = ""  # it does not have an alias column, we set this as null
+    df_ohchr["year"] = pd.to_datetime(
+        df_ohchr["adoption_date"], format="%d %B %Y"
+    ).dt.year
+    df_ohchr["alternative_name"] = ""
     df_ohchr = df_ohchr[cols]
 
     df_uno = pd.read_csv("../treaties/UNO-Treaties.csv")
-    df_uno["year"] = pd.to_datetime(df_uno["date"], format="%d %B %Y").dt.year
+    df_uno["year"] = pd.to_datetime(
+        df_uno["date"], format="%d %B %Y"
+    ).dt.year
     df_uno["alternative_name"] = ""
+    df_uno = df_uno.rename(columns={"name": "title"})[cols]
 
     df_unesco = pd.read_csv("../unesco_instruments/UNESCO_legal_instruments_detail.csv")
-    df_unesco["year"] = pd.to_datetime(df_unesco["date"], format="%d %B %Y").dt.year
+    df_unesco["year"] = pd.to_datetime(
+        df_unesco["date"], format="%d %B %Y"
+    ).dt.year
     df_unesco["alternative_name"] = ""
+    df_unesco = df_unesco.rename(columns={"name": "title"})[cols]
 
-    df_conv_prot_rec = pd.read_csv("../conv-prot-rec/conventions-protocols-recommendations.csv")
+    df_conv_prot_rec = pd.read_csv(
+        "../conv-prot-rec/conventions-protocols-recommendations.csv"
+    )
     df_conv_prot_rec["alternative_name"] = ""
+    df_conv_prot_rec = df_conv_prot_rec[cols]
 
-    df_instrument = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
-    df_instrument.drop_duplicates(inplace=True)
+    df_instrument = pd.concat(
+        [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec],
+        ignore_index=True
+    )
 
     aliases = build_aliases(df_instrument)
-    known_docs, unknown_docs = weak_label_corpus(df_res, aliases)
+    known_docs, unknown_docs = get_or_build_partition(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
-    bio_examples = to_bio_examples(known_docs)
-    trainer, tokenizer, id2label = train_token_classifier(bio_examples)
-
-    silver_df = build_silver_candidates(unknown_docs)
-    if not silver_df.empty:
-        evaluate_generalization(trainer, tokenizer, id2label, unknown_docs, silver_df)
-
-        review_df = (
-            silver_df
-            .drop_duplicates(subset="candidate_span")
-            .assign(decision="", notes="")  # empty columns for you to fill in during review
-            .sort_values("candidate_span")
-        )
-
-        review_df.to_csv("./silver_candidates_for_review.csv", index=False)
+    #bio_examples = to_bio_examples(known_docs)
+    #trainer, tokenizer, id2label = train_token_classifier(bio_examples)

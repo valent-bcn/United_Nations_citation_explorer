@@ -1,16 +1,16 @@
 """
 ICU server version.
-Weakly-supervised NER pipeline for detecting treaty/convention names in UN
-General Assembly resolution text.
+Weakly-supervised NER pipeline for detecting agreement/treaty/convention aka.
+Instrument names in UN General Assembly resolution text.
 
 Pipeline:
-    1. Build a lowercase alias -> entity_id lookup table from several treaty
+    1. Build a lowercase alias -> entity_id lookup table from several instrument
        reference tables (Wikipedia, OHCHR, UNO, UNESCO, conventions/protocols).
     2. Use a spaCy PhraseMatcher over the resolution corpus to weakly label
        spans that match a known alias ("known_docs"); resolutions with no
        match are kept separately ("unknown_docs").
     3. Convert the character-level spans from step 2 into token-level BIO
-       tags (B-TREATY / I-TREATY / O) for HF token classification.
+       tags (B-INSTRUMENT / I-INSTRUMENT / O) for HF token classification.
     4. Fine-tune a token classifier (default: bert-base-uncased) on the BIO
        data with the HF Trainer, logging seqeval precision/recall/F1 to
        stdout and to a CSV file in the training output directory at the end
@@ -50,7 +50,7 @@ from transformers import (
 
 nlp = spacy.load("en_core_web_sm")
 
-LABEL_LIST = ["O", "B-TREATY", "I-TREATY"]
+LABEL_LIST = ["O", "B-INSTRUMENT", "I-INSTRUMENT"]
 LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
 ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
@@ -59,25 +59,30 @@ ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 # 1. ALIAS GENERATION PER ENTITY
 # ---------------------------------------------------------------------------
 
-def build_aliases(df_treaty: pd.DataFrame) -> dict:
-    """Build a {lowercase alias: entity_id} lookup from the treaty table."""
-    aliases = {}
-    for idx, row in df_treaty.iterrows():
-        entity_id = idx
-        variants = {row["title"]}
+def build_aliases(df_instrument: pd.DataFrame) -> dict:
+    """
+    Build a {lowercase alias: alias_id} lookup from the instrument table.
 
-        alt = row.get("alternative_name")
-        if pd.notna(alt):
-            for part in alt.split(";"):
-                v = part.strip()
-                if v:
-                    variants.add(v)
-        for v in list(variants):
-            no_year = re.sub(r"\s*\(?\b(18|19|20)\d{2}\b\)?", "", v).strip()
-            if no_year and no_year != v:
-                variants.add(no_year)
-        for v in variants:
-            aliases[v.lower().strip()] = entity_id
+    Each alias are considered as different forms of titles. Here aliases are
+    not variation such as just changing the year position of the title or
+    just a switch of two words.
+    In any case, this helper serves the NER, not the Entity Linking,
+    Which belongs to a further phase.
+    """
+    aliases = {}
+    for idx, row in df_instrument.iterrows():
+        variants = list(dict.fromkeys(
+            [row["title"]] +
+            (
+                [p.strip() for p in row["alternative_name"].split(";") if p.strip()]
+                if pd.notna(row.get("alternative_name")) else []
+            )
+        ))
+
+        for i, v in enumerate(variants):
+            alias_id = f"{idx}::{i}"
+            aliases[v.lower().strip()] = alias_id
+
     return aliases
 
 
@@ -95,7 +100,7 @@ def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
     """
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
     patterns = [nlp.make_doc(alias) for alias in aliases.keys()]
-    matcher.add("TREATY", patterns)
+    matcher.add("INSTRUMENT", patterns)
 
     known_docs, unknown_docs = [], []
 
@@ -147,9 +152,9 @@ def to_bio_examples(known_docs):
             span = doc.char_span(start, end, alignment_mode="expand")
             if span is None:
                 continue
-            labels[span.start] = "B-TREATY"
+            labels[span.start] = "B-INSTRUMENT"
             for i in range(span.start + 1, span.end):
-                labels[i] = "I-TREATY"
+                labels[i] = "I-INSTRUMENT"
 
         examples.append({
             "doc_id": d["doc_id"],
@@ -166,7 +171,7 @@ def to_bio_examples(known_docs):
 def align_labels(example, tokenizer, label2id=LABEL2ID):
     """
     Tokenize with the model's tokenizer and realign word-level BIO labels
-    to subword tokens. Subword continuations keep I-TREATY if the parent
+    to subword tokens. Subword continuations keep I-INSTRUMENT if the parent
     word was tagged, otherwise O; special tokens get -100 so they're
     ignored by the loss and by seqeval.
     """
@@ -181,7 +186,7 @@ def align_labels(example, tokenizer, label2id=LABEL2ID):
             aligned.append(label2id[example["ner_tags"][wid]])
         else:
             tag = example["ner_tags"][wid]
-            aligned.append(label2id["I-TREATY"] if tag != "O" else label2id["O"])
+            aligned.append(label2id["I-INSTRUMENT"] if tag != "O" else label2id["O"])
         prev_word = wid
     tokenized["labels"] = aligned
     return tokenized
@@ -239,7 +244,7 @@ class MetricsCSVLogger(TrainerCallback):
 
 def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_dir="./treaty-ner"):
     """
-    Fine-tune a token classification model to detect TREATY spans with the
+    Fine-tune a token classification model to detect INSTRUMENT spans with the
     HF Trainer. Per-epoch seqeval metrics are printed to stdout and appended
     to <output_dir>/eval_metrics.csv via MetricsCSVLogger.
     """
@@ -261,16 +266,15 @@ def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_
         output_dir=output_dir,
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=2,  # don't fill the disk with a checkpoint every epoch
         logging_strategy="epoch",
         learning_rate=2e-5,
-        per_device_train_batch_size=32,  # was 1 — bump way up, GPU memory allowing
+        per_device_train_batch_size=32,
         per_device_eval_batch_size=64,  # eval doesn't need grads, can go higher than train
-        gradient_accumulation_steps=1,  # raise this instead of batch size if you hit OOM
+        gradient_accumulation_steps=2,  # raise this instead of batch size if you hit OOM
         dataloader_num_workers=4,  # parallel batch loading, keeps GPU fed
         group_by_length=True,  # buckets similar-length sequences -> less padding waste
         fp16=True,  # or bf16=True on Ampere+ (A100, RTX 30/40xx, H100)
-        num_train_epochs=8,
+        num_train_epochs=10,
         weight_decay=0.005,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
@@ -303,7 +307,7 @@ def train_token_classifier(bio_examples, model_name="bert-base-uncased", output_
 
 def build_silver_candidates(unknown_docs):
     """
-    Detect treaty/convention candidates via lexical pattern in docs where
+    Detect instrument candidates via lexical pattern in docs where
     the gazetteer found NO match. Used to measure whether the model
     generalises to names outside the original alias list.
     """
@@ -316,7 +320,7 @@ def build_silver_candidates(unknown_docs):
         {"LOWER": {"IN": ["in", "of"]}, "OP": "?"},
         {"POS": "PROPN", "OP": "+"},
     ]
-    matcher.add("TREATY_LIKE", [pattern])
+    matcher.add("INSTRUMENT_LIKE", [pattern])
 
     silver = []
     for d in unknown_docs:
@@ -421,10 +425,10 @@ if __name__ == "__main__":
     df_conv_prot_rec = pd.read_csv("/home/user/branes/NER-data/conventions-protocols-recommendations.csv")
     df_conv_prot_rec["alternative_name"] = ""
 
-    df_treaty = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
-    df_treaty.drop_duplicates(inplace=True)
+    df_instrument = pd.concat([df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec], ignore_index=True)
+    df_instrument.drop_duplicates(inplace=True)
 
-    aliases = build_aliases(df_treaty)
+    aliases = build_aliases(df_instrument)
     known_docs, unknown_docs = weak_label_corpus(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 

@@ -12,6 +12,8 @@ treaties/treaty-ner/*
 
 # instruments (NER)
 instrument-ner/checkpoints/*
+instrument-ner/data/*
+instrument-ner/*.csv
 
 # unesco instruments
 unesco_instruments/*.csv
