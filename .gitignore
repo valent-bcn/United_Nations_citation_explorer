@@ -15,6 +15,9 @@ instrument-ner/checkpoints/*
 instrument-ner/data/*
 instrument-ner/*.csv
 
+# instruments (EL)
+instrument-el/*.csv
+
 # unesco instruments
 unesco_instruments/*.csv
 unesco_instruments/*.zip
