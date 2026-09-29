@@ -154,20 +154,20 @@ def save_partition(known_docs, unknown_docs, out_dir="./data/partition"):
     # unknown docs: no spans, just id + text
     unknown_rows = [{"doc_id": d["doc_id"], "text": d["text"]} for d in unknown_docs]
     unknown_df = pd.DataFrame(unknown_rows, columns=["doc_id", "text"])
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
     unknown_df.to_csv(unknown_path, index=False)
 
     return known_path, unknown_path
 
 def partition_exists(out_dir="./data/partition"):
     known_path = os.path.join(out_dir, "partition_known.csv")
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
     return os.path.exists(known_path) and os.path.exists(unknown_path)
 
 
 def load_partition(out_dir="./data/partition"):
     known_path = os.path.join(out_dir, "partition_known.csv")
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
 
     known_df = pd.read_csv(known_path)
     unknown_df = pd.read_csv(unknown_path)
