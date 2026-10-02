@@ -2,6 +2,8 @@
 # document embeddings FAISS and numpy storage
 document_embeddings/faiss_docs_resolutions.bin
 document_embeddings/faiss_docs_resolutions.npy
+document_embeddings/subject_analysis/*.png
+document_embeddings/subject_analysis/*.csv
 
 # treaties
 treaties/*.csv

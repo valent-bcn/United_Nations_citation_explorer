@@ -58,78 +58,163 @@ ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
 
 # ---------------------------------------------------------------------------
-# 1. ALIAS GENERATION PER ENTITY
+# 1. LIST GENERATION ACROSS ALL ENTITIES
 # ---------------------------------------------------------------------------
-
-def build_aliases(df_instrument: pd.DataFrame) -> dict:
+def build_golden_list(df_instrument: pd.DataFrame) -> list[str]:
     """
-    Build a {lowercase alias: alias_id} lookup from the instrument table.
+    Build the backbone of the weak labelling.
 
-    Each alias are considered as different forms of titles. Here aliases are
-    not variation such as just changing the year position of the title or
-    just a switch of two words.
-    In any case, this helper serves the NER, not the Entity Linking,
-    Which belongs to a further phase.
+    Official titles and aliases receive the same treatment. Either the
+    official name or an alias can be used in training. The train/eval
+    partition should therefore be based on this list rather than on
+    individual entities.
+
+    Parameters
+    ----------
+    df_instrument:
+        DataFrame containing at least ["title", "alternative_name", ...].
+
+    Returns
+    -------
+    list[str]
+        Names (official titles and alternative names) that the
+        PhraseMatcher should detect.
     """
-    aliases = {}
-    for idx, row in df_instrument.iterrows():
-        variants = list(dict.fromkeys(
-            [row["title"]] +
-            (
-                [p.strip() for p in row["alternative_name"].split(";") if p.strip()]
-                if pd.notna(row.get("alternative_name")) else []
-            )
-        ))
+    if df_instrument.empty:
+        return []
 
-        for i, v in enumerate(variants):
-            alias_id = f"{idx}::{i}"
-            aliases[v.lower().strip()] = alias_id
+    golden_list = []
 
-    return aliases
+    # Official titles
+    titles = [
+        t.strip()
+        for t in df_instrument["title"].dropna()
+        if t.strip()
+    ]
+
+    # Alternative names
+    aliases = []
+    for value in df_instrument["alternative_name"].dropna():
+        aliases.extend(
+            p.strip()
+            for p in value.split(";")
+            if p.strip()
+        )
+
+    golden_list.extend(titles)
+    golden_list.extend(aliases)
+
+    return golden_list
 
 # ---------------------------------------------------------------------------
 # 2. WEAK LABELING WITH PhraseMatcher
 # ---------------------------------------------------------------------------
 
-def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
+def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str]):
     """
-    df_res: columns 'id', 'content'.
+    Weakly label documents using a list of instrument names.
 
-    Returns:
-        known_docs: list of dicts {doc_id, text, spans: [(start_char, end_char, entity_id)]}
-        unknown_docs: list of dicts {doc_id, text}  (no alias detected at all)
+    Parameters
+    ----------
+    df_res:
+        DataFrame containing columns ["id", "content"].
+
+    golden_list:
+        List of official instrument names and aliases returned by
+        build_golden_list().
+
+    Returns
+    -------
+    known_docs:
+        List of dictionaries:
+        {
+            "doc_id": ...,
+            "text": ...,
+            "spans": [(start_char, end_char, matched_text)]
+        }
+
+    unknown_docs:
+        List of dictionaries:
+        {
+            "doc_id": ...,
+            "text": ...
+        }
+
+    Notes
+    -----
+    Unlike the previous dictionary-based implementation, there is no
+    entity/alias ID associated with a match. The matched text itself is
+    returned.
     """
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-    patterns = [nlp.make_doc(alias) for alias in aliases.keys()]
+
+    # Build patterns directly from the list
+    patterns = [
+        nlp.make_doc(name)
+        for name in golden_list
+        if isinstance(name, str) and name.strip()
+    ]
+
     matcher.add("INSTRUMENT", patterns)
 
-    known_docs, unknown_docs = [], []
+    known_docs = []
+    unknown_docs = []
 
     for _, row in df_res.iterrows():
-        doc = nlp(row["content"])
+        text = row["content"]
+        doc = nlp(text)
+
         matches = matcher(doc)
 
         if not matches:
-            unknown_docs.append({"doc_id": row["id"], "text": row["content"]})
+            unknown_docs.append({
+                "doc_id": row["id"],
+                "text": text,
+            })
             continue
 
-        spans = []
-        seen = set()
+        # Sort longest matches first so that, in case of overlap,
+        # the more specific/longer match is kept.
         matches_sorted = sorted(
             matches,
-            key=lambda m: doc[m[1]:m[2]].end_char - doc[m[1]:m[2]].start_char,
+            key=lambda match: (
+                doc[match[1]:match[2]].end_char
+                - doc[match[1]:match[2]].start_char
+            ),
             reverse=True,
         )
-        for match_id, start, end in matches_sorted:
-            span = doc[start:end]
-            if any(span.start_char < s[1] and span.end_char > s[0] for s in seen):
-                continue  # overlaps with an already accepted match
-            seen.add((span.start_char, span.end_char))
-            alias_text = span.text.lower().strip()
-            alias_id = aliases.get(alias_text)
-            spans.append((span.start_char, span.end_char, alias_id))
 
-        known_docs.append({"doc_id": row["id"], "text": row["content"], "spans": spans})
+        spans = []
+        seen = []
+
+        for _, start, end in matches_sorted:
+            span = doc[start:end]
+
+            # Skip overlapping spans
+            if any(
+                span.start_char < seen_end
+                and span.end_char > seen_start
+                for seen_start, seen_end in seen
+            ):
+                continue
+
+            seen.append(
+                (span.start_char, span.end_char)
+            )
+
+            spans.append(
+                (
+                    span.start_char,
+                    span.end_char,
+                    span.text,
+                )
+            )
+
+        known_docs.append({
+            "doc_id": row["id"],
+            "text": text,
+            "spans": spans,
+        })
 
     return known_docs, unknown_docs
 
@@ -338,7 +423,7 @@ def train_token_classifier(bio_examples,
         logging_strategy="epoch",       # print train loss at each epoch too, for comparison
         learning_rate=2e-5,
         per_device_train_batch_size=1,
-        num_train_epochs=10,
+        num_train_epochs=2,
         weight_decay=0.005,
         load_best_model_at_end=True,
         metric_for_best_model="f1",     # which of the compute_metrics keys decides "best"
@@ -412,9 +497,9 @@ if __name__ == "__main__":
         ignore_index=True
     )
 
-    aliases = build_aliases(df_instrument)
+    aliases = build_golden_list(df_instrument)
     known_docs, unknown_docs = get_or_build_partition(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
-    #bio_examples = to_bio_examples(known_docs)
-    #trainer, tokenizer, id2label = train_token_classifier(bio_examples)
+    bio_examples = to_bio_examples(known_docs)
+    trainer, tokenizer, id2label = train_token_classifier(bio_examples)
