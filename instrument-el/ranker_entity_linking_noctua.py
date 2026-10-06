@@ -1,6 +1,4 @@
 """
-resolve_instruments.py
-
 Resolves NER-extracted entity mentions (e.g. label == "INSTRUMENT") against a
 canonical catalogue of legal instruments (treaties, conventions, resolutions,
 recommendations, ...) using a Qwen3 CrossEncoder reranker.

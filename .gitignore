@@ -5,6 +5,7 @@ document_embeddings/faiss_docs_resolutions.npy
 document_embeddings/subject_analysis/*.png
 document_embeddings/subject_analysis/*.csv
 document_embeddings/subject_analysis/score_distributions/*
+
 # treaties
 treaties/*.csv
 treaties/*.txt
@@ -44,6 +45,10 @@ conv-prot-rec/*.csv
 conv-prot-rec/*.txt
 conv-prot-rec/*.pdf
 conv-prot-rec/*.md
+
+# resolutions from SpiritRAG project
+spiritRAG_corpora/data/*
+spiritRAG_corpora/*.csv
 
 # Qwen data
 Qwen3/data/
