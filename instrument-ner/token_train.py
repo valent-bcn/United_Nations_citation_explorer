@@ -20,12 +20,12 @@ Pipeline:
        also detects, as a rough proxy for how well it generalises beyond the
        original alias list.
 """
-#TODO: Repeat the train with the extended dataset of DICED (SpiritRAG) update with the instruments found in UNKOWN
 
 import csv
 import os
 import re
 from functools import partial
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,10 @@ from transformers import (
 import json
 from pathlib import Path
 
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.blank("en")
+
+# Number of texts per nlp.pipe() batch.
+BATCH_SIZE = 32
 
 LABEL_LIST = ["O", "B-INSTRUMENT", "I-INSTRUMENT"]
 LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
@@ -110,7 +113,7 @@ def build_golden_list(df_instrument: pd.DataFrame) -> list[str]:
 # 2. WEAK LABELING WITH PhraseMatcher
 # ---------------------------------------------------------------------------
 
-def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str]):
+def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str], batch_size: int = BATCH_SIZE):
     """
     Weakly label documents using a list of instrument names.
 
@@ -122,6 +125,9 @@ def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str]):
     golden_list:
         List of official instrument names and aliases returned by
         build_golden_list().
+
+    batch_size:
+        Number of texts per nlp.pipe() batch.
 
     Returns
     -------
@@ -160,15 +166,22 @@ def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str]):
     known_docs = []
     unknown_docs = []
 
-    for _, row in df_res.iterrows():
-        text = row["content"]
-        doc = nlp(text)
+    # Stream the corpus through nlp.pipe(). It yields docs in input order, so
+    # zipping against the (id, text) rows keeps each doc paired with its id.
+    rows = list(
+        df_res[["id", "content"]].itertuples(index=False, name=None)
+    )
+    texts = (text for _, text in rows)
 
+    for (doc_id, text), doc in zip(
+        rows,
+        nlp.pipe(texts, batch_size=batch_size),
+    ):
         matches = matcher(doc)
 
         if not matches:
             unknown_docs.append({
-                "doc_id": row["id"],
+                "doc_id": doc_id,
                 "text": text,
             })
             continue
@@ -211,7 +224,7 @@ def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str]):
             )
 
         known_docs.append({
-            "doc_id": row["id"],
+            "doc_id": doc_id,
             "text": text,
             "spans": spans,
         })
@@ -289,15 +302,18 @@ def get_or_build_partition(df_res, aliases, out_dir="./data/partition"):
 # 3. SETTING BIO TAGS (formatting HF token classification)
 # ---------------------------------------------------------------------------
 
-def to_bio_examples(known_docs):
+def to_bio_examples(known_docs, batch_size: int = BATCH_SIZE):
     """
     Convert each doc's character-level spans into tokens + BIO labels,
     using spaCy's tokenizer for the split (this gets realigned to the
     model's own tokenizer later, in align_labels / Dataset.map).
     """
     examples = []
-    for d in known_docs:
-        doc = nlp(d["text"])
+
+    # Stream the texts through nlp.pipe(); docs come back in input order.
+    docs = nlp.pipe((d["text"] for d in known_docs), batch_size=batch_size)
+
+    for d, doc in zip(known_docs, docs):
         labels = ["O"] * len(doc)
 
         for start, end, _entity_id in d["spans"]:
@@ -395,6 +411,8 @@ class MetricsCSVLogger(TrainerCallback):
 
 
 def train_token_classifier(bio_examples,
+                           doc_years,
+                           eval_from_year=2015,
                            model_name="bert-base-uncased",
                            output_dir="./checkpoints/"):
     """
@@ -404,12 +422,14 @@ def train_token_classifier(bio_examples,
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    ds = Dataset.from_list(bio_examples)
-    ds = ds.train_test_split(test_size=0.15, seed=42, shuffle=True)
-    ds = ds.map(
-        partial(align_labels, tokenizer=tokenizer),
-        remove_columns=["tokens", "ner_tags", "doc_id"],
-    )
+    train_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] < eval_from_year]
+    eval_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] >= eval_from_year]
+    print(f"train: {len(train_ex)} | eval (>= {eval_from_year}): {len(eval_ex)}")
+
+    align = partial(align_labels, tokenizer=tokenizer)
+    cols = ["tokens", "ner_tags", "doc_id"]
+    train_ds = Dataset.from_list(train_ex).map(align, remove_columns=cols)
+    eval_ds = Dataset.from_list(eval_ex).map(align, remove_columns=cols)
 
     model = AutoModelForTokenClassification.from_pretrained(
         model_name, num_labels=len(LABEL_LIST), id2label=ID2LABEL, label2id=LABEL2ID
@@ -420,32 +440,27 @@ def train_token_classifier(bio_examples,
         output_dir=output_dir,
         eval_strategy="epoch",
         save_strategy="epoch",
-        logging_strategy="epoch",       # print train loss at each epoch too, for comparison
+        logging_strategy="epoch",
         learning_rate=2e-5,
         per_device_train_batch_size=1,
         num_train_epochs=2,
         weight_decay=0.005,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",     # which of the compute_metrics keys decides "best"
+        metric_for_best_model="f1",
         greater_is_better=True,
     )
 
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=ds["train"],
-        eval_dataset=ds["test"],
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
         processing_class=tokenizer,
-        compute_metrics=compute_metrics,        # <-- triggers seqeval metrics each epoch
-        callbacks=[MetricsCSVLogger(output_dir)],  # <-- writes those metrics to CSV each epoch
+        compute_metrics=compute_metrics,
+        callbacks=[MetricsCSVLogger(output_dir)],
     )
     trainer.train()
-
-    # trainer.state.log_history also has a per-epoch record of eval_precision/eval_recall/eval_f1
-    # if you want to plot the evolution afterward in-memory instead of re-reading the CSV, e.g.:
-    #   hist = pd.DataFrame(trainer.state.log_history)
-    #   hist[hist["eval_f1"].notna()][["epoch", "eval_precision", "eval_recall", "eval_f1"]]
 
     return trainer, tokenizer, ID2LABEL
 
@@ -454,9 +469,13 @@ def train_token_classifier(bio_examples,
 # DATA LOAD & RUN
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    df_res = pd.read_csv("../resolutions/ga_resolutions_1946_2019.csv")
+    df_res = pd.read_csv("../resolutions/ga_resolutions_1946_2025.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
-    df_res = df_res.tail(100)
+    df_res["year"] = pd.to_datetime(
+        df_res["date_c"], format="%d %B %Y", errors="coerce"
+    ).dt.year
+
+    doc_years = dict(zip(df_res["id"], df_res["year"]))
 
     cols = ["title", "year", "alternative_name"]
 
@@ -502,4 +521,4 @@ if __name__ == "__main__":
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
     bio_examples = to_bio_examples(known_docs)
-    trainer, tokenizer, id2label = train_token_classifier(bio_examples)
+    trainer, tokenizer, id2label = train_token_classifier(bio_examples, doc_years)

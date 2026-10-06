@@ -25,6 +25,7 @@ import csv
 import os
 import re
 from functools import partial
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -49,7 +50,10 @@ from transformers import (
 import json
 from pathlib import Path
 
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.blank("en")
+
+# Number of texts per nlp.pipe() batch.
+BATCH_SIZE = 64
 
 LABEL_LIST = ["O", "B-INSTRUMENT", "I-INSTRUMENT"]
 LABEL2ID = {label: i for i, label in enumerate(LABEL_LIST)}
@@ -57,78 +61,173 @@ ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 
 
 # ---------------------------------------------------------------------------
-# 1. ALIAS GENERATION PER ENTITY
+# 1. LIST GENERATION ACROSS ALL ENTITIES
 # ---------------------------------------------------------------------------
-
-def build_aliases(df_instrument: pd.DataFrame) -> dict:
+def build_golden_list(df_instrument: pd.DataFrame) -> list[str]:
     """
-    Build a {lowercase alias: alias_id} lookup from the instrument table.
+    Build the backbone of the weak labelling.
 
-    Each alias are considered as different forms of titles. Here aliases are
-    not variation such as just changing the year position of the title or
-    just a switch of two words.
-    In any case, this helper serves the NER, not the Entity Linking,
-    Which belongs to a further phase.
+    Official titles and aliases receive the same treatment. Either the
+    official name or an alias can be used in training. The train/eval
+    partition should therefore be based on this list rather than on
+    individual entities.
+
+    Parameters
+    ----------
+    df_instrument:
+        DataFrame containing at least ["title", "alternative_name", ...].
+
+    Returns
+    -------
+    list[str]
+        Names (official titles and alternative names) that the
+        PhraseMatcher should detect.
     """
-    aliases = {}
-    for idx, row in df_instrument.iterrows():
-        variants = list(dict.fromkeys(
-            [row["title"]] +
-            (
-                [p.strip() for p in row["alternative_name"].split(";") if p.strip()]
-                if pd.notna(row.get("alternative_name")) else []
-            )
-        ))
+    if df_instrument.empty:
+        return []
 
-        for i, v in enumerate(variants):
-            alias_id = f"{idx}::{i}"
-            aliases[v.lower().strip()] = alias_id
+    golden_list = []
 
-    return aliases
+    # Official titles
+    titles = [
+        t.strip()
+        for t in df_instrument["title"].dropna()
+        if t.strip()
+    ]
+
+    # Alternative names
+    aliases = []
+    for value in df_instrument["alternative_name"].dropna():
+        aliases.extend(
+            p.strip()
+            for p in value.split(";")
+            if p.strip()
+        )
+
+    golden_list.extend(titles)
+    golden_list.extend(aliases)
+
+    return golden_list
 
 # ---------------------------------------------------------------------------
 # 2. WEAK LABELING WITH PhraseMatcher
 # ---------------------------------------------------------------------------
 
-def weak_label_corpus(df_res: pd.DataFrame, aliases: dict):
+def weak_label_corpus(df_res: pd.DataFrame, golden_list: list[str], batch_size: int = BATCH_SIZE):
     """
-    df_res: columns 'id', 'content'.
+    Weakly label documents using a list of instrument names.
 
-    Returns:
-        known_docs: list of dicts {doc_id, text, spans: [(start_char, end_char, entity_id)]}
-        unknown_docs: list of dicts {doc_id, text}  (no alias detected at all)
+    Parameters
+    ----------
+    df_res:
+        DataFrame containing columns ["id", "content"].
+
+    golden_list:
+        List of official instrument names and aliases returned by
+        build_golden_list().
+
+    batch_size:
+        Number of texts per nlp.pipe() batch.
+
+    Returns
+    -------
+    known_docs:
+        List of dictionaries:
+        {
+            "doc_id": ...,
+            "text": ...,
+            "spans": [(start_char, end_char, matched_text)]
+        }
+
+    unknown_docs:
+        List of dictionaries:
+        {
+            "doc_id": ...,
+            "text": ...
+        }
+
+    Notes
+    -----
+    Unlike the previous dictionary-based implementation, there is no
+    entity/alias ID associated with a match. The matched text itself is
+    returned.
     """
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-    patterns = [nlp.make_doc(alias) for alias in aliases.keys()]
+
+    # Build patterns directly from the list
+    patterns = [
+        nlp.make_doc(name)
+        for name in golden_list
+        if isinstance(name, str) and name.strip()
+    ]
+
     matcher.add("INSTRUMENT", patterns)
 
-    known_docs, unknown_docs = [], []
+    known_docs = []
+    unknown_docs = []
 
-    for _, row in df_res.iterrows():
-        doc = nlp(row["content"])
+    # Stream the corpus through nlp.pipe(). It yields docs in input order, so
+    # zipping against the (id, text) rows keeps each doc paired with its id.
+    rows = list(
+        df_res[["id", "content"]].itertuples(index=False, name=None)
+    )
+    texts = (text for _, text in rows)
+
+    for (doc_id, text), doc in zip(
+        rows,
+        nlp.pipe(texts, batch_size=batch_size),
+    ):
         matches = matcher(doc)
 
         if not matches:
-            unknown_docs.append({"doc_id": row["id"], "text": row["content"]})
+            unknown_docs.append({
+                "doc_id": doc_id,
+                "text": text,
+            })
             continue
 
-        spans = []
-        seen = set()
+        # Sort longest matches first so that, in case of overlap,
+        # the more specific/longer match is kept.
         matches_sorted = sorted(
             matches,
-            key=lambda m: doc[m[1]:m[2]].end_char - doc[m[1]:m[2]].start_char,
+            key=lambda match: (
+                doc[match[1]:match[2]].end_char
+                - doc[match[1]:match[2]].start_char
+            ),
             reverse=True,
         )
-        for match_id, start, end in matches_sorted:
-            span = doc[start:end]
-            if any(span.start_char < s[1] and span.end_char > s[0] for s in seen):
-                continue  # overlaps with an already accepted match
-            seen.add((span.start_char, span.end_char))
-            alias_text = span.text.lower().strip()
-            alias_id = aliases.get(alias_text)
-            spans.append((span.start_char, span.end_char, alias_id))
 
-        known_docs.append({"doc_id": row["id"], "text": row["content"], "spans": spans})
+        spans = []
+        seen = []
+
+        for _, start, end in matches_sorted:
+            span = doc[start:end]
+
+            # Skip overlapping spans
+            if any(
+                span.start_char < seen_end
+                and span.end_char > seen_start
+                for seen_start, seen_end in seen
+            ):
+                continue
+
+            seen.append(
+                (span.start_char, span.end_char)
+            )
+
+            spans.append(
+                (
+                    span.start_char,
+                    span.end_char,
+                    span.text,
+                )
+            )
+
+        known_docs.append({
+            "doc_id": doc_id,
+            "text": text,
+            "spans": spans,
+        })
 
     return known_docs, unknown_docs
 
@@ -153,20 +252,20 @@ def save_partition(known_docs, unknown_docs, out_dir="./data/partition"):
     # unknown docs: no spans, just id + text
     unknown_rows = [{"doc_id": d["doc_id"], "text": d["text"]} for d in unknown_docs]
     unknown_df = pd.DataFrame(unknown_rows, columns=["doc_id", "text"])
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
     unknown_df.to_csv(unknown_path, index=False)
 
     return known_path, unknown_path
 
 def partition_exists(out_dir="./data/partition"):
     known_path = os.path.join(out_dir, "partition_known.csv")
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
     return os.path.exists(known_path) and os.path.exists(unknown_path)
 
 
 def load_partition(out_dir="./data/partition"):
     known_path = os.path.join(out_dir, "partition_known.csv")
-    unknown_path = os.path.join(out_dir, "partition_unkown.csv")
+    unknown_path = os.path.join(out_dir, "partition_unknown.csv")
 
     known_df = pd.read_csv(known_path)
     unknown_df = pd.read_csv(unknown_path)
@@ -203,15 +302,18 @@ def get_or_build_partition(df_res, aliases, out_dir="./data/partition"):
 # 3. SETTING BIO TAGS (formatting HF token classification)
 # ---------------------------------------------------------------------------
 
-def to_bio_examples(known_docs):
+def to_bio_examples(known_docs, batch_size: int = BATCH_SIZE):
     """
     Convert each doc's character-level spans into tokens + BIO labels,
     using spaCy's tokenizer for the split (this gets realigned to the
     model's own tokenizer later, in align_labels / Dataset.map).
     """
     examples = []
-    for d in known_docs:
-        doc = nlp(d["text"])
+
+    # Stream the texts through nlp.pipe(); docs come back in input order.
+    docs = nlp.pipe((d["text"] for d in known_docs), batch_size=batch_size)
+
+    for d, doc in zip(known_docs, docs):
         labels = ["O"] * len(doc)
 
         for start, end, _entity_id in d["spans"]:
@@ -309,6 +411,8 @@ class MetricsCSVLogger(TrainerCallback):
 
 
 def train_token_classifier(bio_examples,
+                           doc_years,
+                           eval_from_year=2015,
                            model_name="bert-base-uncased",
                            output_dir="./checkpoints/"):
     """
@@ -318,12 +422,14 @@ def train_token_classifier(bio_examples,
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    ds = Dataset.from_list(bio_examples)
-    ds = ds.train_test_split(test_size=0.15, seed=42, shuffle=True)
-    ds = ds.map(
-        partial(align_labels, tokenizer=tokenizer),
-        remove_columns=["tokens", "ner_tags", "doc_id"],
-    )
+    train_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] < eval_from_year]
+    eval_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] >= eval_from_year]
+    print(f"train: {len(train_ex)} | eval (>= {eval_from_year}): {len(eval_ex)}")
+
+    align = partial(align_labels, tokenizer=tokenizer)
+    cols = ["tokens", "ner_tags", "doc_id"]
+    train_ds = Dataset.from_list(train_ex).map(align, remove_columns=cols)
+    eval_ds = Dataset.from_list(eval_ex).map(align, remove_columns=cols)
 
     model = AutoModelForTokenClassification.from_pretrained(
         model_name, num_labels=len(LABEL_LIST), id2label=ID2LABEL, label2id=LABEL2ID
@@ -334,32 +440,27 @@ def train_token_classifier(bio_examples,
         output_dir=output_dir,
         eval_strategy="epoch",
         save_strategy="epoch",
-        logging_strategy="epoch",       # print train loss at each epoch too, for comparison
+        logging_strategy="epoch",
         learning_rate=2e-5,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=8,
         num_train_epochs=10,
         weight_decay=0.005,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",     # which of the compute_metrics keys decides "best"
+        metric_for_best_model="f1",
         greater_is_better=True,
     )
 
     trainer = Trainer(
         model=model,
         args=args,
-        train_dataset=ds["train"],
-        eval_dataset=ds["test"],
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
         processing_class=tokenizer,
-        compute_metrics=compute_metrics,        # <-- triggers seqeval metrics each epoch
-        callbacks=[MetricsCSVLogger(output_dir)],  # <-- writes those metrics to CSV each epoch
+        compute_metrics=compute_metrics,
+        callbacks=[MetricsCSVLogger(output_dir)],
     )
     trainer.train()
-
-    # trainer.state.log_history also has a per-epoch record of eval_precision/eval_recall/eval_f1
-    # if you want to plot the evolution afterward in-memory instead of re-reading the CSV, e.g.:
-    #   hist = pd.DataFrame(trainer.state.log_history)
-    #   hist[hist["eval_f1"].notna()][["epoch", "eval_precision", "eval_recall", "eval_f1"]]
 
     return trainer, tokenizer, ID2LABEL
 
@@ -370,6 +471,11 @@ def train_token_classifier(bio_examples,
 if __name__ == "__main__":
     df_res = pd.read_csv("/home/user/branes/NER-data/ga_resolutions_1946_2019.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
+    df_res["year"] = pd.to_datetime(
+        df_res["date_c"], format="%d %B %Y", errors="coerce"
+    ).dt.year
+
+    doc_years = dict(zip(df_res["id"], df_res["year"]))
 
     cols = ["title", "year", "alternative_name"]
 
@@ -400,9 +506,9 @@ if __name__ == "__main__":
         ignore_index=True
     )
 
-    aliases = build_aliases(df_instrument)
+    aliases = build_golden_list(df_instrument)
     known_docs, unknown_docs = get_or_build_partition(df_res, aliases)
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
     bio_examples = to_bio_examples(known_docs)
-    trainer, tokenizer, id2label = train_token_classifier(bio_examples)
+    trainer, tokenizer, id2label = train_token_classifier(bio_examples, doc_years)
