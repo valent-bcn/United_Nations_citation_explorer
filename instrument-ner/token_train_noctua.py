@@ -392,16 +392,21 @@ class MetricsCSVLogger(TrainerCallback):
     the run's output directory every time evaluation runs (i.e. at the end
     of each epoch, given eval_strategy="epoch").
     """
-
-    def __init__(self, output_dir, filename="eval_metrics.csv"):
+    def __init__(self, output_dir, filename="metrics_per_epoch.csv"):
         os.makedirs(output_dir, exist_ok=True)
         self.csv_path = os.path.join(output_dir, filename)
         self._header_written = False
+        self._last_train_loss = None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs:
+            self._last_train_loss = logs["loss"]
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         if not metrics:
             return
-        row = {"epoch": state.epoch, **{k: v for k, v in metrics.items() if isinstance(v, (int, float))}}
+        row = {"epoch": state.epoch, "train_loss": self._last_train_loss,
+               **{k: v for k, v in metrics.items() if isinstance(v, (int, float))}}
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             if not self._header_written:
@@ -469,7 +474,7 @@ def train_token_classifier(bio_examples,
 # DATA LOAD & RUN
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    df_res = pd.read_csv("/home/user/branes/NER-data/ga_resolutions_1946_2019.csv")
+    df_res = pd.read_csv("/home/user/branes/NER-data/ga_resolutions_1946_2025.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
     df_res["year"] = pd.to_datetime(
         df_res["date_c"], format="%d %B %Y", errors="coerce"
@@ -484,7 +489,6 @@ if __name__ == "__main__":
 
     df_ohchr = pd.read_csv("/home/user/branes/NER-data/ohchr_instruments_detailed-instit.csv")
     df_ohchr["year"] = pd.to_datetime(df_ohchr["adoption_date"], format="%d %B %Y").dt.year
-    df_ohchr["alternative_name"] = ""  # it does not have an alias column, we set this as null
     df_ohchr = df_ohchr[cols]
 
     df_uno = pd.read_csv("/home/user/branes/NER-data/UNO-Treaties.csv")
@@ -500,6 +504,9 @@ if __name__ == "__main__":
     df_conv_prot_rec = pd.read_csv("/home/user/branes/NER-data/conventions-protocols-recommendations.csv")
     df_conv_prot_rec["alternative_name"] = ""
     df_conv_prot_rec = df_conv_prot_rec[cols]
+
+    ad_hoc = pd.read_csv("/home/user/branes/NER-data/ad_hoc_instruments.csv")
+    ad_hoc = ad_hoc[cols]
 
     df_instrument = pd.concat(
         [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec],
