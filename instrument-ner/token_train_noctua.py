@@ -39,6 +39,7 @@ from seqeval.metrics import (
 )
 from spacy.matcher import Matcher, PhraseMatcher
 from transformers import (
+    AutoConfig,
     AutoModelForTokenClassification,
     AutoTokenizer,
     DataCollatorForTokenClassification,
@@ -336,14 +337,22 @@ def to_bio_examples(known_docs, batch_size: int = BATCH_SIZE):
 # 4. TOKEN CLASSIFIER FINE-TUNING (HF Trainer)
 # ---------------------------------------------------------------------------
 
-def align_labels(example, tokenizer, label2id=LABEL2ID):
+def align_labels(example, tokenizer, label2id=LABEL2ID, max_length=512):
     """
-    Tokenize with the model's tokenizer and realign word-level BIO labels
-    to subword tokens. Subword continuations keep I-INSTRUMENT if the parent
-    word was tagged, otherwise O; special tokens get -100 so they're
-    ignored by the loss and by seqeval.
+    Model-agnostic alignment of word-level BIO labels to subword tokens.
+
+    Relies only on the fast tokenizer's `word_ids()`, so it works the same for
+    WordPiece (BERT), byte-level BPE (RoBERTa) and SentencePiece (DeBERTa-v3).
+    Only the FIRST subword of each word carries the word's label; special
+    tokens and continuation subwords get -100, so they are ignored by the loss
+    and by seqeval (this matches the comment in compute_metrics).
     """
-    tokenized = tokenizer(example["tokens"], is_split_into_words=True, truncation=True)
+    tokenized = tokenizer(
+        example["tokens"],
+        is_split_into_words=True,
+        truncation=True,
+        max_length=max_length,  # some tokenizers report a huge model_max_length
+    )
     word_ids = tokenized.word_ids()
     aligned = []
     prev_word = None
@@ -353,8 +362,7 @@ def align_labels(example, tokenizer, label2id=LABEL2ID):
         elif wid != prev_word:
             aligned.append(label2id[example["ner_tags"][wid]])
         else:
-            tag = example["ner_tags"][wid]
-            aligned.append(label2id["I-INSTRUMENT"] if tag != "O" else label2id["O"])
+            aligned.append(-100)
         prev_word = wid
     tokenized["labels"] = aligned
     return tokenized
@@ -425,7 +433,11 @@ def train_token_classifier(bio_examples,
     HF Trainer. Per-epoch seqeval metrics are printed to stdout and appended
     to <output_dir>/eval_metrics.csv via MetricsCSVLogger.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # RoBERTa-style (byte-level BPE) tokenizers refuse pre-split input unless
+    # add_prefix_space=True; BERT/DeBERTa don't need it.
+    model_type = AutoConfig.from_pretrained(model_name).model_type
+    tok_kwargs = {"add_prefix_space": True} if model_type in {"roberta", "gpt2", "longformer", "bart"} else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
 
     train_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] < eval_from_year]
     eval_ex = [ex for ex in bio_examples if doc_years[ex["doc_id"]] >= eval_from_year]
@@ -474,6 +486,18 @@ def train_token_classifier(bio_examples,
 # DATA LOAD & RUN
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fine-tune a token classifier for instrument NER.")
+    parser.add_argument("--model-name", default="bert-base-uncased",
+                        help="HF model id, e.g. roberta-base, microsoft/deberta-v3-base")
+    parser.add_argument("--output-dir", default=None,
+                        help="Defaults to ./checkpoints-<model-name> (slashes replaced by '-')")
+    parser.add_argument("--eval-from-year", type=int, default=2015)
+    args_cli = parser.parse_args()
+
+    safe_name = args_cli.model_name.replace("/", "-")
+    output_dir = args_cli.output_dir or f"./checkpoints-{safe_name}"
+    print(f"model: {args_cli.model_name} | output_dir: {output_dir}")
+
     df_res = pd.read_csv("/home/user/branes/NER-data/ga_resolutions_1946_2025.csv")
     df_res.rename(columns={"res_id2": "id"}, inplace=True)
     df_res["year"] = pd.to_datetime(
@@ -518,4 +542,10 @@ if __name__ == "__main__":
     print(f"Docs with a known match: {len(known_docs)} | without match: {len(unknown_docs)}")
 
     bio_examples = to_bio_examples(known_docs)
-    trainer, tokenizer, id2label = train_token_classifier(bio_examples, doc_years)
+    trainer, tokenizer, id2label = train_token_classifier(
+        bio_examples,
+        doc_years,
+        eval_from_year=args_cli.eval_from_year,
+        model_name=args_cli.model_name,
+        output_dir=output_dir,
+    )
