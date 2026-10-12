@@ -533,7 +533,7 @@ if __name__ == "__main__":
     ad_hoc = ad_hoc[cols]
 
     df_instrument = pd.concat(
-        [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec],
+        [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec, ad_hoc],
         ignore_index=True
     )
 

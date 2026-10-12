@@ -304,7 +304,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--window",
         type=int,
-        default=100,
+        default=150,
         help="Chars of context before/after the entity span",
     )
 
