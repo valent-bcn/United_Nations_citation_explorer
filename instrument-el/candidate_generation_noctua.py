@@ -64,7 +64,6 @@ def build_instrument_catalogue(args: argparse.Namespace) -> pd.DataFrame:
     df_ohchr["year"] = pd.to_datetime(
         df_ohchr["adoption_date"], format="%d %B %Y", errors="coerce"
     ).dt.year
-    df_ohchr["alternative_name"] = ""
     df_ohchr = df_ohchr[cols]
 
     df_uno = pd.read_csv(args.uno_treaties)
@@ -85,9 +84,12 @@ def build_instrument_catalogue(args: argparse.Namespace) -> pd.DataFrame:
     df_conv_prot_rec["alternative_name"] = ""
     df_conv_prot_rec = df_conv_prot_rec[cols]
 
+    ad_hoc = pd.read_csv("/home/user/branes/NER-data/ad_hoc_instruments.csv")
+    ad_hoc = ad_hoc[cols]
+
     df_instrument = pd.concat(
-        [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec],
-        ignore_index=True,
+        [df_wiki, df_ohchr, df_uno, df_unesco, df_conv_prot_rec, ad_hoc],
+        ignore_index=True
     )
 
     # Drop rows with no title at all, they can't be matched to anything.
@@ -126,7 +128,7 @@ def load_resolutions(args: argparse.Namespace) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 def load_entities(args: argparse.Namespace) -> pd.DataFrame:
     df_ent = pd.read_csv(args.entities)
-    required = {"id", "text", "score", "start", "end", "label"}
+    required = {"doc_id", "text", "score", "start", "end", "label"}
     missing = required - set(df_ent.columns)
     if missing:
         raise ValueError(f"Entities CSV is missing columns: {missing}")
@@ -266,7 +268,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--ga-resolutions",
-        default="/home/user/branes/NER-data/ga_resolutions_1946_2019.csv",
+        default="/home/user/branes/NER-data/ga_resolutions_1946_2025.csv",
         help="CSV with full resolution texts (df_res source)",
     )
     p.add_argument(
@@ -349,9 +351,6 @@ def main():
     print("Loading entities...")
     df_ent = load_entities(args)
     print(f"  {len(df_ent)} entities to resolve")
-    #TODO: true resize when debugged
-    df_ent = df_ent[df_ent["score"]>0.9]
-    df_ent = df_ent.tail(10)
 
     if df_ent.empty:
         print("Nothing to resolve, exiting.")
