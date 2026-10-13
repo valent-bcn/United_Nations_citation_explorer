@@ -133,7 +133,7 @@ def load_entities(args: argparse.Namespace) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Entities CSV is missing columns: {missing}")
 
-    df_ent["id"] = df_ent["id"].astype(str).str.strip()
+    df_ent["doc_id"] = df_ent["doc_id"].astype(str).str.strip()
     df_ent["start"] = df_ent["start"].astype(int)
     df_ent["end"] = df_ent["end"].astype(int)
 
