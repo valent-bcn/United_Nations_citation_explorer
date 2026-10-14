@@ -18,23 +18,6 @@ Pipeline
    context string with Qwen3-Reranker, and keep the top-k matches.
 6. Write a result CSV with the best match (and optionally the top-k) per
    entity.
-
-Assumptions you should double check
-------------------------------------
-* `df_res` is assumed to have a text column. Its name is NOT specified in
-  the prompt, so it's controlled by `--res-text-col` (default: "text").
-  If your resolutions CSV uses a different column (e.g. "full_text",
-  "resolution_text", "content"), pass it explicitly.
-* `df_res["id"]` and the entities CSV's `id` column are both cast to `str`
-  before joining, since ids like "3319 (xxix)" are not numeric.
-* The catalogue document string is built as
-      f"{title} Year: {year}"
-  (interpreted from "as string + Year : {title}" in the request, which
-  looks like a typo for `{year}`; change `build_document_text` if you meant
-  something else).
-* Only entities whose `label` matches `--label-filter` (default
-  "INSTRUMENT") are resolved; everything else is skipped. Pass
-  `--label-filter ""` to disable filtering.
 """
 
 from __future__ import annotations
@@ -190,7 +173,15 @@ def resolve_entities(
     results = []
     missing_ids = set()
 
-    for _, ent in tqdm(df_ent.iterrows(), total=len(df_ent), desc="Resolving entities"):
+    # tqdm tracks elapsed time, iteration rate, and ETA without us having to
+    # calculate time.time() on every iteration or print the model answer/query.
+    for _, ent in tqdm(
+        df_ent.iterrows(),
+        total=len(df_ent),
+        desc="Resolving entities",
+        unit="entity",
+        mininterval=1.0,
+    ):
         res_id = ent["doc_id"]
         if res_id not in res_lookup.index:
             missing_ids.add(res_id)
@@ -245,7 +236,7 @@ def resolve_entities(
         )
 
     if missing_ids:
-        print(
+        tqdm.write(
             f"WARNING: {len(missing_ids)} distinct resolution id(s) from the entities CSV "
             f"were not found in df_res and were left unresolved, e.g. "
             f"{list(missing_ids)[:5]}"
@@ -318,13 +309,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=3,
         help="Number of candidate instruments to keep per entity",
     )
     p.add_argument(
         "--batch-size",
         type=int,
-        default=4,
+        default=8,
     )
 
     p.add_argument(
