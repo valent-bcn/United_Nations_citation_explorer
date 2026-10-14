@@ -191,7 +191,7 @@ def resolve_entities(
     missing_ids = set()
 
     for _, ent in tqdm(df_ent.iterrows(), total=len(df_ent), desc="Resolving entities"):
-        res_id = ent["id"]
+        res_id = ent["doc_id"]
         if res_id not in res_lookup.index:
             missing_ids.add(res_id)
             results.append(
@@ -312,7 +312,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--model",
-        default="Qwen/Qwen3-Reranker-8B",
+        default="Qwen/Qwen3-Reranker-4B",
         help="CrossEncoder model name",
     )
     p.add_argument(
