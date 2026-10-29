@@ -50,6 +50,9 @@ conv-prot-rec/*.md
 spiritRAG_corpora/data/*
 spiritRAG_corpora/*.csv
 
+# miscelania
+miscelania/*.png
+
 # Qwen data
 Qwen3/data/
 Qwen3/checkpoints_silver_legacy/
